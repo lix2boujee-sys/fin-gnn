@@ -1,0 +1,46 @@
+# Table 5: Generator Robustness Across LLMs
+# Tests Qwen2.5-7B vs Llama-3.1-8B with Hybrid vs FEG-Rerank
+
+root_dir: "."
+datasets:
+  - finder
+
+chunk_size: 512
+chunk_overlap: 64
+
+retrieval:
+  bm25_k1: 1.5
+  bm25_b: 0.75
+  dense_model: "sentence-transformers/all-MiniLM-L6-v2"
+  top_k: 50
+  hybrid_alpha: 0.5
+
+graph:
+  use_edge_weights: true
+
+rerank:
+  ppr_alpha: 0.85
+  fusion_alpha: 0.3
+  fusion_beta: 0.4
+  fusion_gamma: 0.0
+  fusion_delta: 0.3
+
+constraint:
+  enabled: true
+
+generation:
+  model: "Qwen/Qwen2.5-7B-Instruct"
+  temperature: 0.0
+  max_tokens: 256
+  top_k_evidence: 5
+  use_local_model: true
+  alt_models:
+    - "Qwen/Qwen2.5-7B-Instruct"
+    - "meta-llama/Llama-3.1-8B-Instruct"
+
+evaluation:
+  recall_k_values: [1, 5, 10]
+  metrics:
+    - answer_accuracy
+    - faithfulness
+    - numerical_consistency

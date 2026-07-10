@@ -1,0 +1,32 @@
+# FEG-RAG default experiment configuration
+# Override any key; missing keys fall back to config.DEFAULTS.
+
+root_dir: "."
+data_dir: "FinDER/data"
+edgar_dir: "10-k"
+output_dir: "outputs"
+cache_dir: "cache"
+
+datasets:
+  - finder
+  # - tatqa
+  # - finqa
+
+chunk_size: 512
+chunk_overlap: 64
+
+retrieval:
+  dense_model: "sentence-transformers/all-MiniLM-L6-v2"
+  top_k: 50
+
+graph:
+  node_types:
+    - chunk
+    - metric
+    - year
+
+rerank:
+  gnn_model: "sage"  # sage | rgcn
+
+evaluation:
+  recall_k_values: [1, 3, 5, 10, 20]

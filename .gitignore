@@ -1,0 +1,32 @@
+# Python / environment
+.venv/
+conda-env/
+.tmp/
+__pycache__/
+*.pyc
+*.pyo
+
+# Cache & outputs
+cache/
+outputs/
+
+# Data (large files)
+FinDER/
+10-k/
+
+# API keys & secrets
+.env
+*.env
+*_api_key*
+*_secret*
+
+# IDE
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

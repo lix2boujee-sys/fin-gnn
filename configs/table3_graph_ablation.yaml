@@ -1,0 +1,32 @@
+# Table 3: Graph Structure Ablation
+# Compares No Graph / Semantic Only / Financial Only / Combined / Full Weighted
+
+root_dir: "."
+datasets:
+  - finder
+
+chunk_size: 512
+chunk_overlap: 64
+
+retrieval:
+  bm25_k1: 1.5
+  bm25_b: 0.75
+  dense_model: "sentence-transformers/all-MiniLM-L6-v2"
+  top_k: 50
+  hybrid_alpha: 0.5
+
+graph:
+  node_types: ["company", "filing", "section", "chunk", "metric", "year"]
+  use_edge_weights: true
+
+rerank:
+  ppr_alpha: 0.85
+
+generation:
+  model: "gpt-4o"
+  temperature: 0.0
+  max_tokens: 1
+  top_k_evidence: 0
+
+evaluation:
+  recall_k_values: [1, 3, 5, 10]
