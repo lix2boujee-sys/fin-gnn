@@ -16,7 +16,7 @@ import numpy as np
 
 from feg_rag.data.chunker import Chunk
 
-DEFAULT_LOCAL_MODEL = Path("cache/models/all-MiniLM-L6-v2")
+DEFAULT_LOCAL_MODEL = Path("D:/fin-gnn/cache/models/all-MiniLM-L6-v2")
 
 
 class _TransformersEncoder:

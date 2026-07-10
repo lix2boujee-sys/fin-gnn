@@ -1,7 +1,7 @@
 # Table 4: Edge Type Ablation
 # Removes company/filing/section/metric/year/semantic edges one at a time
 
-root_dir: "."
+root_dir: "D:/fin-gnn"
 datasets:
   - finder
 

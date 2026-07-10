@@ -1,7 +1,7 @@
 # Table 3: Graph Structure Ablation
 # Compares No Graph / Semantic Only / Financial Only / Combined / Full Weighted
 
-root_dir: "."
+root_dir: "D:/fin-gnn"
 datasets:
   - finder
 

@@ -116,6 +116,7 @@ def run_exp3(
     output_k: int = 10,
     add_semantic_edges: bool = True,
     ppr_alpha: float = 0.85,
+    dense_device: str = "cpu",
     verbose: bool = True,
 ) -> Dict[str, List[Dict]]:
     """Run all Exp3 variants and return per-method results."""
@@ -131,7 +132,10 @@ def run_exp3(
         b=cfg.retrieval.get("bm25_b", 0.75),
     )
     bm25.index(corpus_chunks)
-    dense = DenseRetriever(model_name=cfg.retrieval.get("dense_model", "all-MiniLM-L6-v2"))
+    dense = DenseRetriever(
+        model_name=cfg.retrieval.get("dense_model", "all-MiniLM-L6-v2"),
+        device=dense_device,
+    )
     dense.index(corpus_chunks)
     hybrid = HybridRetriever(bm25, dense, alpha=cfg.retrieval.get("hybrid_alpha", 0.5))
 
@@ -232,6 +236,7 @@ def run_exp3(
         # Hybrid retrieval (baseline)
         hybrid_results = hybrid.search(question, top_k=top_n)
         candidate_ids = [c.chunk_id for c, _ in hybrid_results]
+        retrieval_scores = {c.chunk_id: float(score) for c, score in hybrid_results}
 
         # Build query entities for PPR seeds
         q_metrics = extractor.extract_metrics(question)
@@ -250,6 +255,8 @@ def run_exp3(
             seed_metric_names=list(q_metrics),
             seed_year_values=list(q_years),
             alpha=ppr_alpha,
+            retrieval_scores=retrieval_scores,
+            retrieval_weight=cfg.rerank.get("ppr_retrieval_weight", 0.5),
         )
         ppr_sem_ids = [cid for cid, _ in ppr_sem[:output_k]]
         all_results["hybrid+semantic_ppr"].append(
@@ -263,6 +270,8 @@ def run_exp3(
             seed_metric_names=list(q_metrics),
             seed_year_values=list(q_years),
             alpha=ppr_alpha,
+            retrieval_scores=retrieval_scores,
+            retrieval_weight=cfg.rerank.get("ppr_retrieval_weight", 0.5),
         )
         ppr_fin_ids = [cid for cid, _ in ppr_fin[:output_k]]
         all_results["hybrid+financial_ppr"].append(
@@ -276,6 +285,8 @@ def run_exp3(
             seed_metric_names=list(q_metrics),
             seed_year_values=list(q_years),
             alpha=ppr_alpha,
+            retrieval_scores=retrieval_scores,
+            retrieval_weight=cfg.rerank.get("ppr_retrieval_weight", 0.5),
         )
         ppr_full_dict = dict(ppr_full)
         ppr_full_ids = [cid for cid, _ in ppr_full[:output_k]]
@@ -546,6 +557,8 @@ def main() -> None:
     parser.add_argument("--no_semantic_edges", action="store_true",
                         help="Skip semantic edges (faster, smaller graph)")
     parser.add_argument("--max_distractor_files", type=int, default=50)
+    parser.add_argument("--dense_device", default="cpu",
+                        help="Device for Dense encoding (cpu avoids GPU OOM)")
     args = parser.parse_args()
 
     cfg = Config.from_yaml(args.config)
@@ -589,6 +602,7 @@ def main() -> None:
         output_k=args.output_k,
         add_semantic_edges=add_semantic,
         ppr_alpha=args.ppr_alpha,
+        dense_device=args.dense_device,
         verbose=True,
     )
     elapsed = time.time() - t0

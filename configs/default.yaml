@@ -1,7 +1,7 @@
 # FEG-RAG default experiment configuration
 # Override any key; missing keys fall back to config.DEFAULTS.
 
-root_dir: "."
+root_dir: "D:/fin-gnn"
 data_dir: "FinDER/data"
 edgar_dir: "10-k"
 output_dir: "outputs"
@@ -16,7 +16,7 @@ chunk_size: 512
 chunk_overlap: 64
 
 retrieval:
-  dense_model: "sentence-transformers/all-MiniLM-L6-v2"
+  dense_model: "D:/fin-gnn/cache/models/all-MiniLM-L6-v2"
   top_k: 50
 
 graph:

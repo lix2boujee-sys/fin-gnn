@@ -1,7 +1,7 @@
 # Table 5: Generator Robustness Across LLMs
 # Tests Qwen2.5-7B vs Llama-3.1-8B with Hybrid vs FEG-Rerank
 
-root_dir: "."
+root_dir: "D:/fin-gnn"
 datasets:
   - finder
 

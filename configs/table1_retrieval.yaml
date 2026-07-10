@@ -2,7 +2,7 @@
 # Evaluates BM25, Dense, Hybrid, Cross-Encoder, PPR, and Constraint-fused reranking
 # No LLM generation needed — retrieval metrics only
 
-root_dir: "."
+root_dir: "D:/fin-gnn"
 datasets:
   - finder
 

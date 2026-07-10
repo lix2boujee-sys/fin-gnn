@@ -197,6 +197,7 @@ def evaluate_reranker_on_samples(
         # Hybrid retrieval
         hybrid_results = hybrid.search(question, top_k=top_n)
         candidate_ids = [c.chunk_id for c, _ in hybrid_results]
+        retrieval_scores = {c.chunk_id: float(score) for c, score in hybrid_results}
 
         # PPR scores for fusion
         q_metrics = extractor.extract_metrics(question)
@@ -207,6 +208,7 @@ def evaluate_reranker_on_samples(
             seed_metric_names=list(q_metrics),
             seed_year_values=list(q_years),
             alpha=ppr_alpha,
+            retrieval_scores=retrieval_scores,
         ))
 
         # Rerank
@@ -763,7 +765,12 @@ def main() -> None:
                         help="Device for GNN training/eval (cuda recommended)")
     parser.add_argument("--dense_device", default="cpu",
                         help="Device for Dense encoding (cpu avoids 4GB GPU OOM)")
-    parser.add_argument("--val_split", type=float, default=0.2)
+    parser.add_argument("--val_split", type=float, default=0.2,
+                        help="Train/val split ratio (val used only for training holdout)")
+    parser.add_argument("--eval_on", choices=["all", "val"], default="all",
+                        help="Evaluate metrics on all samples (Exp1-aligned) or val holdout only")
+    parser.add_argument("--split_seed", type=int, default=42,
+                        help="Shuffle seed for train/val split")
     parser.add_argument("--top_n", type=int, default=50)
     parser.add_argument("--no_ablation", action="store_true",
                         help="Skip all ablation studies")
@@ -839,7 +846,8 @@ def main() -> None:
     print(f"  Device:    {device} (GNN)")
     print(f"  Dense:     {args.dense_device} (encoding, avoids GPU OOM)")
     print(f"  Epochs:    {cfg.rerank.get('gnn_epochs', 'default')}")
-    print(f"  Val split: {args.val_split}")
+    print(f"  Val split: {args.val_split} (train holdout)")
+    print(f"  Eval on:   {args.eval_on} ({'5703 test, same as Exp1' if args.eval_on == 'all' else 'val holdout only'})")
     print(f"  Ablation:  edge={run_edge_abl}  hard_negative={run_hneg_abl}")
 
     write_run_status(output_dir, current_stage="starting", output_path=str(output_dir))
@@ -850,17 +858,22 @@ def main() -> None:
     total_available = len(samples)
     if args.num_samples > 0:
         samples = samples[:args.num_samples]
-    random.shuffle(samples)
+    rng = random.Random(args.split_seed)
+    rng.shuffle(samples)
     n_val = max(1, int(len(samples) * args.val_split))
     train_samples = samples[n_val:]
     val_samples = samples[:n_val]
+    eval_samples = samples if args.eval_on == "all" else val_samples
     print(f"  Train: {len(train_samples)}  |  Val: {len(val_samples)}  |  "
-          f"Total: {len(samples)}  |  Available: {total_available}")
+          f"Eval: {len(eval_samples)}  |  Total: {len(samples)}  |  "
+          f"Available: {total_available}")
 
     write_run_status(output_dir,
                      current_stage="data_loaded",
                      train_samples=len(train_samples),
                      val_samples=len(val_samples),
+                     eval_samples=len(eval_samples),
+                     eval_on=args.eval_on,
                      total_samples=len(samples),
                      total_available=total_available)
 
@@ -1009,14 +1022,15 @@ def main() -> None:
                      train_pairs=meta.get("num_pairs", 0))
 
     # ---- 6. Evaluate all methods ----
-    print("\n[6/6] Evaluating all methods on validation set...")
+    eval_label = "full test set (Exp1-aligned)" if args.eval_on == "all" else "validation holdout"
+    print(f"\n[6/6] Evaluating all methods on {eval_label} ({len(eval_samples)} samples)...")
     extractor = EntityExtractor()
     all_results: Dict[str, List[Dict]] = {}
 
     # Hybrid baseline
     print("  Hybrid...")
     all_results["hybrid"] = []
-    for s in val_samples:
+    for s in eval_samples:
         results = hybrid.search(s["question"], top_k=args.top_n)
         ids = [c.chunk_id for c, _ in results[:10]]
         all_results["hybrid"].append(
@@ -1026,9 +1040,10 @@ def main() -> None:
     # PPR baseline
     print("  PPR...")
     all_results["hybrid+ppr"] = []
-    for s in val_samples:
+    for s in eval_samples:
         hybrid_results = hybrid.search(s["question"], top_k=args.top_n)
         candidate_ids = [c.chunk_id for c, _ in hybrid_results]
+        retrieval_scores = {c.chunk_id: float(score) for c, score in hybrid_results}
         q_metrics = extractor.extract_metrics(s["question"])
         q_years = extractor.extract_years(s["question"])
         ppr_scores = ppr_rerank(
@@ -1037,6 +1052,7 @@ def main() -> None:
             seed_metric_names=list(q_metrics),
             seed_year_values=list(q_years),
             alpha=cfg.rerank.get("ppr_alpha", 0.85),
+            retrieval_scores=retrieval_scores,
         )
         ppr_ids = [cid for cid, _ in ppr_scores[:10]]
         all_results["hybrid+ppr"].append(
@@ -1047,7 +1063,7 @@ def main() -> None:
     print(f"  GNN ({model_type})...")
     method_name = f"hybrid+{model_type}"
     all_results[method_name] = evaluate_reranker_on_samples(
-        reranker, val_samples, hybrid, graph, features,
+        reranker, eval_samples, hybrid, graph, features,
         gold_map, chunk_by_id, extractor,
         top_n=args.top_n,
     )
@@ -1092,7 +1108,7 @@ def main() -> None:
 
     if run_edge_abl:
         edge_results = run_edge_ablation(
-            cfg, train_samples, val_samples, corpus_chunks,
+            cfg, train_samples, eval_samples, corpus_chunks,
             gold_map, hybrid, chunk_embeddings, entity_map, output_dir, device,
         )
         ablation_results = ablation_results or {}
@@ -1103,7 +1119,7 @@ def main() -> None:
 
     if run_hneg_abl:
         hn_results = run_hard_negative_ablation(
-            cfg, train_samples, val_samples, corpus_chunks,
+            cfg, train_samples, eval_samples, corpus_chunks,
             gold_map, hybrid, graph, chunk_embeddings, entity_map, output_dir, device,
         )
         ablation_results = ablation_results or {}
@@ -1127,6 +1143,9 @@ def main() -> None:
                 "model": model_type,
                 "train_samples": len(train_samples),
                 "val_samples": len(val_samples),
+                "eval_samples": len(eval_samples),
+                "eval_on": args.eval_on,
+                "split_seed": args.split_seed,
                 "corpus_chunks": len(corpus_chunks),
                 "gold_evidence_chunks": len(gold_chunk_ids),
                 "graph_nodes": graph.num_nodes,

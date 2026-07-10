@@ -1,7 +1,7 @@
 # Table 2: Answer Reliability with Fixed LLM
 # Compares different retrieval → generation pipelines with Qwen2.5-7B-Instruct
 
-root_dir: "."
+root_dir: "D:/fin-gnn"
 datasets:
   - finder
 

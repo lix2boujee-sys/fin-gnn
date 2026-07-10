@@ -1,13 +1,10 @@
-# FEG-RAG 环境配置 — 项目内 conda-env + cache
+# FEG-RAG GPU 环境配置 — 全部使用 D:\fin-gnn，不占用 C 盘
 # 用法:  .\setup_env.ps1
-# 注意: 首次使用前请先创建 conda 环境:
-#   conda create -p .\conda-env python=3.10
-#   .\conda-env\python.exe -m pip install -r requirements.txt
 
-$ProjectRoot = (Get-Location).Path
+$ProjectRoot = "D:\fin-gnn"
 $CondaEnv    = "$ProjectRoot\conda-env"
 
-# 缓存 / 临时目录
+# 缓存 / 临时目录全部放 D 盘项目内
 $env:PIP_CACHE_DIR              = "$ProjectRoot\cache\pip"
 $env:HF_HOME                     = "$ProjectRoot\cache\huggingface"
 $env:TORCH_HOME                  = "$ProjectRoot\cache\torch"
@@ -31,7 +28,7 @@ foreach ($dir in @(
 $env:PATH = "$CondaEnv;$CondaEnv\Scripts;$CondaEnv\Library\bin;" + $env:PATH
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host " FEG-RAG 环境 (项目内)" -ForegroundColor Cyan
+Write-Host " FEG-RAG 环境 (D 盘项目内)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host " Python:  $CondaEnv\python.exe"
 Write-Host " 缓存:    $ProjectRoot\cache"
