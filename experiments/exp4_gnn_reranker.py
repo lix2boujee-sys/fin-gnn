@@ -81,11 +81,10 @@ def _default_device() -> str:
 
 
 # =============================================================================
-# Expected constants (for validation)
+# Expected constants are now computed dynamically from the actual embedding
+# dimension so that both MiniLM (384-dim) and E5-Mistral (4096-dim) work
+# without source-code changes.
 # =============================================================================
-
-EXPECTED_DENSE_DIM = 384   # all-MiniLM-L6-v2
-EXPECTED_FEATURE_DIM = 391  # 384 + 1 + 3 + 2 + 1
 
 
 # =============================================================================
@@ -645,6 +644,13 @@ def write_exp4_readme(
     summaries: Dict[str, Dict],
     k_values: List[int],
     model_type: str,
+    dense_model: str = "",
+    dense_backend: str = "",
+    dense_embedding_dim: int = 0,
+    feature_dim: int = 0,
+    dense_device: str = "cpu",
+    dense_batch_size: str = "auto",
+    command: str = "",
 ) -> None:
     """Generate Exp4 README."""
     hybrid = summaries.get("hybrid", {})
@@ -660,13 +666,19 @@ def write_exp4_readme(
         "",
         f"Trained {model_type.upper()} reranker on Financial Evidence Graph.",
         "",
+        "## Dense encoder",
+        "",
+        f"- Model: `{dense_model}`",
+        f"- Backend: `{dense_backend}`",
+        f"- Embedding dim: `{dense_embedding_dim}`",
+        f"- Feature dim: `{feature_dim}`",
+        f"- Device: `{dense_device}`",
+        f"- Batch size: `{dense_batch_size}`",
+        "",
         "## Run command",
         "",
         "```bash",
-        "python experiments/exp4_gnn_reranker.py \\",
-        f"  --config configs/default.yaml \\",
-        f"  --output_dir outputs/exp4_gnn_reranker \\",
-        f"  --epochs 10",
+        f"{command or '# (see train_config.yaml for full command)'}",
         "```",
         "",
         "## Model comparison",
@@ -765,6 +777,9 @@ def main() -> None:
                         help="Device for GNN training/eval (cuda recommended)")
     parser.add_argument("--dense_device", default="cpu",
                         help="Device for Dense encoding (cpu avoids 4GB GPU OOM)")
+    parser.add_argument("--dense_batch_size", type=int, default=None,
+                        help="Batch size for dense encoding (default: auto; "
+                             "use 1-4 for E5-Mistral on CPU)")
     parser.add_argument("--val_split", type=float, default=0.2,
                         help="Train/val split ratio (val used only for training holdout)")
     parser.add_argument("--eval_on", choices=["all", "val"], default="all",
@@ -841,14 +856,16 @@ def main() -> None:
     print("=" * 60)
     print(f"  EXP4: GNN Evidence Reranker ({model_type.upper()})")
     print("=" * 60)
-    print(f"  Output:    {output_dir}")
-    print(f"  Model:     {model_type}")
-    print(f"  Device:    {device} (GNN)")
-    print(f"  Dense:     {args.dense_device} (encoding, avoids GPU OOM)")
-    print(f"  Epochs:    {cfg.rerank.get('gnn_epochs', 'default')}")
-    print(f"  Val split: {args.val_split} (train holdout)")
-    print(f"  Eval on:   {args.eval_on} ({'5703 test, same as Exp1' if args.eval_on == 'all' else 'val holdout only'})")
-    print(f"  Ablation:  edge={run_edge_abl}  hard_negative={run_hneg_abl}")
+    print(f"  Output:     {output_dir}")
+    print(f"  Model:      {model_type}")
+    print(f"  Device:     {device} (GNN)")
+    print(f"  Dense:      {args.dense_device} (encoding)")
+    print(f"  Dense batch:{args.dense_batch_size or 'auto'}")
+    print(f"  Dense model:{cfg.retrieval.get('dense_model', 'default')}")
+    print(f"  Epochs:     {cfg.rerank.get('gnn_epochs', 'default')}")
+    print(f"  Val split:  {args.val_split} (train holdout)")
+    print(f"  Eval on:    {args.eval_on} ({'5703 test, same as Exp1' if args.eval_on == 'all' else 'val holdout only'})")
+    print(f"  Ablation:   edge={run_edge_abl}  hard_negative={run_hneg_abl}")
 
     write_run_status(output_dir, current_stage="starting", output_path=str(output_dir))
 
@@ -914,8 +931,12 @@ def main() -> None:
     dense = DenseRetriever(
         model_name=cfg.retrieval.get("dense_model", "all-MiniLM-L6-v2"),
         device=args.dense_device,
+        query_instruction=cfg.retrieval.get("dense_query_instruction"),
+        e5_max_seq_length=cfg.retrieval.get("e5_max_seq_length", 512),
+        e5_batch_size=cfg.retrieval.get("e5_batch_size"),
+        debug=cfg.retrieval.get("debug_dense", False),
     )
-    dense.index(corpus_chunks)
+    dense.index(corpus_chunks, batch_size=args.dense_batch_size)
     chunk_embeddings = dense.chunk_embeddings()
     embedding_dim = next(iter(chunk_embeddings.values())).shape[0] if chunk_embeddings else 0
 
@@ -926,9 +947,10 @@ def main() -> None:
     if embedding_dim == 0:
         print("  [ERROR] Dense embeddings are empty! Cannot proceed.")
         sys.exit(1)
-    if embedding_dim != EXPECTED_DENSE_DIM:
+    expected_dim = dense.embedding_dim
+    if expected_dim and embedding_dim != expected_dim:
         print(f"  [WARN] WARNING: Dense embedding dim is {embedding_dim}, "
-              f"expected {EXPECTED_DENSE_DIM} for all-MiniLM-L6-v2.")
+              f"expected {expected_dim} for the configured model.")
 
     hybrid = HybridRetriever(bm25, dense, alpha=cfg.retrieval.get("hybrid_alpha", 0.5))
 
@@ -965,17 +987,21 @@ def main() -> None:
     feature_dim = next(iter(features.values())).shape[0]
     print(f"  Feature dim: {feature_dim}")
 
-    # Feature dim validation
+    # Feature dim validation — compute expected dynamically
+    num_node_types = 3  # chunk, metric, year
+    expected_feature_dim = embedding_dim + 1 + num_node_types + 2 + 1
+
     if chunk_embeddings and not args.no_embeddings:
-        if feature_dim != EXPECTED_FEATURE_DIM:
+        if feature_dim != expected_feature_dim:
             print(f"  [WARN] WARNING: Feature dim is {feature_dim}, expected "
-                  f"{EXPECTED_FEATURE_DIM} for neural embeddings "
-                  f"(384 + 1 + 3 + 2 + 1). Check node type encoding!")
+                  f"{expected_feature_dim} "
+                  f"({embedding_dim} + 1 + {num_node_types} + 2 + 1). "
+                  f"Check node type encoding!")
     if args.sanity:
-        if feature_dim == EXPECTED_FEATURE_DIM:
-            print(f"  [OK] Feature dim == {EXPECTED_FEATURE_DIM} (correct)")
+        if feature_dim == expected_feature_dim:
+            print(f"  [OK] Feature dim == {expected_feature_dim} (correct)")
         else:
-            print(f"  [MISMATCH] Feature dim {feature_dim} != {EXPECTED_FEATURE_DIM} "
+            print(f"  [MISMATCH] Feature dim {feature_dim} != {expected_feature_dim} "
                   f"(MISMATCH -- pipeline issue!)")
 
     write_run_status(output_dir,
@@ -1132,7 +1158,16 @@ def main() -> None:
     total_elapsed = time.time() - t0
     print(f"\nTotal time: {total_elapsed:.1f}s")
     write_exp4_outputs(output_dir, all_results, summaries, k_values)
-    write_exp4_readme(output_dir, summaries, k_values, model_type)
+    write_exp4_readme(
+        output_dir, summaries, k_values, model_type,
+        dense_model=cfg.retrieval.get("dense_model", ""),
+        dense_backend=dense.backend,
+        dense_embedding_dim=embedding_dim,
+        feature_dim=feature_dim,
+        dense_device=args.dense_device,
+        dense_batch_size=str(args.dense_batch_size or "auto"),
+        command=" ".join(sys.argv),
+    )
 
     # Save train config
     config_path = output_dir / "train_config.yaml"
@@ -1151,8 +1186,11 @@ def main() -> None:
                 "graph_nodes": graph.num_nodes,
                 "graph_edges": graph.num_edges,
                 "feature_dim": feature_dim,
+                "dense_model": cfg.retrieval.get("dense_model", ""),
                 "dense_backend": dense.backend,
                 "dense_embedding_dim": embedding_dim,
+                "dense_device": args.dense_device,
+                "dense_batch_size": args.dense_batch_size or "auto",
                 "final_loss": history[-1] if history else None,
                 "elapsed_seconds": total_elapsed,
             }

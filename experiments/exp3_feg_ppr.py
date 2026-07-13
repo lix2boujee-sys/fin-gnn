@@ -117,6 +117,7 @@ def run_exp3(
     add_semantic_edges: bool = True,
     ppr_alpha: float = 0.85,
     dense_device: str = "cpu",
+    dense_batch_size: int | None = None,
     verbose: bool = True,
 ) -> Dict[str, List[Dict]]:
     """Run all Exp3 variants and return per-method results."""
@@ -135,8 +136,12 @@ def run_exp3(
     dense = DenseRetriever(
         model_name=cfg.retrieval.get("dense_model", "all-MiniLM-L6-v2"),
         device=dense_device,
+        query_instruction=cfg.retrieval.get("dense_query_instruction"),
+        e5_max_seq_length=cfg.retrieval.get("e5_max_seq_length", 512),
+        e5_batch_size=cfg.retrieval.get("e5_batch_size"),
+        debug=cfg.retrieval.get("debug_dense", False),
     )
-    dense.index(corpus_chunks)
+    dense.index(corpus_chunks, batch_size=dense_batch_size)
     hybrid = HybridRetriever(bm25, dense, alpha=cfg.retrieval.get("hybrid_alpha", 0.5))
 
     # ---- Build entity map ----
@@ -307,7 +312,12 @@ def run_exp3(
             build_result_record(s, "hybrid+full_ppr+constraint", fused_ids, gold_ids)
         )
 
-    return all_results
+    dense_info = {
+        "backend": dense.backend,
+        "embedding_dim": dense.embedding_dim,
+        "model_name": cfg.retrieval.get("dense_model", ""),
+    }
+    return all_results, dense_info
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -405,7 +415,15 @@ def write_outputs(
     write_case_studies(output_dir, all_results)
 
     # README
-    write_readme(output_dir, summaries, k_values)
+    write_readme(
+        output_dir, summaries, k_values,
+        dense_model=dense_info.get("model_name", ""),
+        dense_backend=dense_info.get("backend", ""),
+        dense_embedding_dim=dense_info.get("embedding_dim", 0) or 0,
+        dense_device=args.dense_device,
+        dense_batch_size=str(args.dense_batch_size or "auto"),
+        command=" ".join(sys.argv),
+    )
 
 
 def write_case_studies(output_dir: Path, all_results: Dict[str, List[Dict]]) -> None:
@@ -455,6 +473,12 @@ def write_readme(
     output_dir: Path,
     summaries: Dict[str, Dict],
     k_values: List[int],
+    dense_model: str = "",
+    dense_backend: str = "",
+    dense_embedding_dim: int = 0,
+    dense_device: str = "cpu",
+    dense_batch_size: str = "auto",
+    command: str = "",
 ) -> None:
     """Generate Exp3 README."""
     hybrid = summaries.get("hybrid", {})
@@ -469,13 +493,18 @@ def write_readme(
         "",
         "Graph-based reranking WITHOUT training any model.",
         "",
+        "## Dense encoder",
+        "",
+        f"- Model: `{dense_model}`",
+        f"- Backend: `{dense_backend}`",
+        f"- Embedding dim: `{dense_embedding_dim}`",
+        f"- Device: `{dense_device}`",
+        f"- Batch size: `{dense_batch_size}`",
+        "",
         "## Run command",
         "",
         "```bash",
-        "python experiments/exp3_feg_ppr.py \\",
-        "  --config configs/default.yaml \\",
-        "  --output_dir outputs/exp3_feg_ppr \\",
-        "  --top_n 50",
+        f"{command or '# (see train_config.yaml for full command)'}",
         "```",
         "",
         "## Results",
@@ -559,6 +588,9 @@ def main() -> None:
     parser.add_argument("--max_distractor_files", type=int, default=50)
     parser.add_argument("--dense_device", default="cpu",
                         help="Device for Dense encoding (cpu avoids GPU OOM)")
+    parser.add_argument("--dense_batch_size", type=int, default=None,
+                        help="Batch size for dense encoding (default: auto; "
+                             "use 1-4 for E5-Mistral on CPU)")
     args = parser.parse_args()
 
     cfg = Config.from_yaml(args.config)
@@ -575,6 +607,9 @@ def main() -> None:
     print("  EXP3: Financial Evidence Graph + PPR Reranking")
     print("=" * 60)
     print(f"  Output:         {output_dir}")
+    print(f"  Dense model:    {cfg.retrieval.get('dense_model', 'default')}")
+    print(f"  Dense device:   {args.dense_device}")
+    print(f"  Dense batch:    {args.dense_batch_size or 'auto'}")
     print(f"  Top-N hybrid:   {args.top_n}")
     print(f"  Semantic edges: {add_semantic}")
     print(f"  PPR alpha:      {args.ppr_alpha}")
@@ -596,13 +631,14 @@ def main() -> None:
     # 3. Run experiment
     print("[3/4] Running PPR reranking...")
     t0 = time.time()
-    all_results = run_exp3(
+    all_results, dense_info = run_exp3(
         cfg, samples, corpus_chunks, gold_map,
         top_n=args.top_n,
         output_k=args.output_k,
         add_semantic_edges=add_semantic,
         ppr_alpha=args.ppr_alpha,
         dense_device=args.dense_device,
+        dense_batch_size=args.dense_batch_size,
         verbose=True,
     )
     elapsed = time.time() - t0

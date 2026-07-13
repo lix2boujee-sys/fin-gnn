@@ -1,0 +1,59 @@
+# Table 3: Main Answer Generation Experiment with Qwen2.5-7B
+# Tests whether better evidence ranking → better generated financial answers.
+# No LLM reranking, no LLM post-processing.
+#
+# Usage:
+#   python experiments/table3_main_generation_qwen25_7b.py \
+#       --config configs/table3_main_generation_qwen25_7b.yaml
+
+root_dir: "D:/fin-gnn"
+data_dir: "FinDER/data"
+edgar_dir: "10-k"
+output_dir: "outputs/table3_main_generation_qwen25_7b"
+cache_dir: "cache"
+
+datasets:
+  - finder
+
+chunk_size: 512
+chunk_overlap: 64
+
+retrieval:
+  dense_model: "D:/fin-gnn/cache/models/e5-mistral-7b-instruct"
+  top_k: 50
+  hybrid_alpha: 0.5
+  bm25_k1: 1.5
+  bm25_b: 0.75
+
+cross_encoder:
+  model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  top_k_rerank: 100
+  batch_size: 32
+
+rerank:
+  ppr_alpha: 0.85
+  gnn_model: "rgcn"
+  gnn_hidden: 128
+  gnn_epochs: 10
+  gnn_lr: 0.001
+  gnn_dropout: 0.3
+  fusion_alpha: 0.3
+  fusion_beta: 0.3
+  fusion_gamma: 0.4
+  fusion_delta: 0.0
+
+constraint:
+  enabled: true
+  company_match_weight: 1.0
+  year_match_weight: 1.0
+  metric_match_weight: 0.8
+  filing_type_match_weight: 0.5
+
+generation:
+  llm_model: "qwen/qwen-2.5-7b-instruct"
+  temperature: 0.0
+  max_tokens: 512
+  top_k_evidence: 5
+
+evaluation:
+  recall_k_values: [5, 10]

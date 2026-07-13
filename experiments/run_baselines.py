@@ -82,7 +82,13 @@ def main() -> None:
     bm25.index(corpus_chunks)
 
     print("  - Dense index...")
-    dense = DenseRetriever(model_name=cfg.retrieval["dense_model"])
+    dense = DenseRetriever(
+        model_name=cfg.retrieval["dense_model"],
+        query_instruction=cfg.retrieval.get("dense_query_instruction"),
+        e5_max_seq_length=cfg.retrieval.get("e5_max_seq_length", 512),
+        e5_batch_size=cfg.retrieval.get("e5_batch_size"),
+        debug=cfg.retrieval.get("debug_dense", False),
+    )
     dense.index(corpus_chunks)
 
     hybrid = HybridRetriever(bm25, dense, alpha=cfg.retrieval["hybrid_alpha"])

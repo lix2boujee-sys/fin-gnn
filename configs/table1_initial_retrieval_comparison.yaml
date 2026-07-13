@@ -1,0 +1,61 @@
+# Table 1: Initial Retrieval Performance Comparison — Local (Windows)
+# Compares first-stage retrievers on the Financial Evidence Retrieval Benchmark.
+# No reranking, no graph methods, no LLM.
+#
+# Methods compared:
+#   - BM25 (lexical)
+#   - Dense Retriever (all-MiniLM-L6-v2)
+#   - Hybrid Retriever (BM25 + all-MiniLM-L6-v2)
+#   - ColBERTv2 (colbert-ir/colbertv2.0, pretrained)
+#   - E5-Mistral-7B-Instruct (e5-mistral-7b-instruct, INDEPENDENT from Dense)
+#
+# Usage:
+#   # Smoke test (no ColBERT)
+#   python experiments/table1_initial_retrieval_comparison.py \
+#       --config configs/table1_initial_retrieval_comparison.yaml \
+#       --limit_samples 20 --skip_colbert
+#
+#   # Full experiment
+#   python experiments/table1_initial_retrieval_comparison.py \
+#       --config configs/table1_initial_retrieval_comparison.yaml \
+#       --output_dir outputs/table1_initial_retrieval_comparison_20260712 \
+#       --dense_device cuda
+
+root_dir: "D:/fin-gnn"
+data_dir: "FinDER/data"
+edgar_dir: "10-k"
+output_dir: "outputs/table1_initial_retrieval_comparison"
+cache_dir: "cache"
+
+chunk_size: 512
+chunk_overlap: 64
+
+retrieval:
+  top_k: 50
+  bm25_k1: 1.5
+  bm25_b: 0.75
+  # Dense Retriever model — used for the "Dense Retriever" row and Hybrid fusion.
+  dense_model: "D:/fin-gnn/cache/models/all-MiniLM-L6-v2"
+  # E5-Mistral-7B-Instruct model — used ONLY for the "E5-Mistral-7B-Instruct" row.
+  e5_model: "D:/fin-gnn/cache/models/e5-mistral-7b-instruct"
+  # Query instruction for E5-Mistral query encoding
+  dense_query_instruction: "Given a financial question, retrieve relevant evidence passages from SEC filings that directly support the answer."
+  e5_max_seq_length: 512
+  dense_batch_size: 4
+  e5_batch_size: 4
+  debug_dense: false
+  hybrid_alpha: 0.5
+
+colbert:
+  enabled: true
+  checkpoint: "colbert-ir/colbertv2.0"
+  root: "cache/colbert"
+  index_name: "finder_colbertv2"
+  nbits: 2
+  doc_maxlen: 300
+  query_maxlen: 64
+
+evaluation:
+  recall_k_values: [5, 10, 50]
+  ndcg_k_values: [10]
+  hit_k_values: [10]

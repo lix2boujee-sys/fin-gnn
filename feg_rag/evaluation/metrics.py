@@ -81,7 +81,10 @@ def compute_all_metrics(
             retrieved = r.get("retrieved_chunk_ids", [])[:k]
             if gold:
                 recalls.append(len(gold & set(retrieved)) / len(gold))
-                precisions.append(len(gold & set(retrieved)) / len(retrieved))
+                if retrieved:
+                    precisions.append(len(gold & set(retrieved)) / len(retrieved))
+                else:
+                    precisions.append(0.0)
             else:
                 recalls.append(0.0)
                 precisions.append(0.0)

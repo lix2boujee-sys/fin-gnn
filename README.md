@@ -1,165 +1,182 @@
-# FEG-RAG
+# FEG-RAG: Financial Evidence Graph Retrieval-Augmented Generation
 
-Financial Evidence Graph RAG — 在 [FinDER](https://huggingface.co/datasets) 金融 QA 基准上，对比纯检索、图 + PPR 重排、GNN 重排（GraphSAGE / R-GCN）。
+This repository contains the reproducible code for financial evidence retrieval and graph-assisted reranking experiments on FinDER-style SEC filing evidence retrieval.
 
-构建 **Financial Evidence Graph**（company / filing / section / chunk / metric / year），系统评估 BM25、Dense、Hybrid 及图方法对证据检索的影响。
+The code compares first-stage retrievers such as BM25, dense retrieval, hybrid retrieval, ColBERTv2, and E5-Mistral-7B-Instruct, then evaluates graph-based reranking methods such as PPR, GraphSAGE, and R-GCN.
 
----
+## What Is Included
 
-## 实验概览
+- `feg_rag/`: retrieval, graph construction, reranking, evaluation, and generation utilities.
+- `experiments/`: scripts for Table I retrieval comparison, non-LLM reranking, graph reranking, and LLM generation experiments.
+- `configs/`: YAML configs for local and cloud runs.
+- `scripts/`: helper scripts such as E5-Mistral model download.
+- `tests/`: smoke tests for critical retrieval paths.
 
-| 实验 | 脚本 | 研究问题 |
-|------|------|----------|
-| **Exp1** | `experiments/exp1_retrieval_baseline.py` | 无图结构下，纯检索 baseline 上限是多少？ |
-| **Exp2** | `experiments/exp2_error_analysis.py` | 检索失败是金融结构错误还是完全未命中？ |
-| **Exp3** | `experiments/exp3_feg_ppr.py` | 建图 + PPR 能否在不训练的情况下提升排序？ |
-| **Exp4** | `experiments/exp4_gnn_reranker.py` | 训练的 GNN 能否超过 PPR / Hybrid？ |
+## What Is Not Included
 
-**数据集**：FinDER 全量 **5703** QA 样本，语料 **31607** chunks（含 10-K 干扰项）  
-**Dense 模型**：`all-MiniLM-L6-v2`（本地或 HuggingFace）  
-**评估协议**：Exp1 / Exp3 / Exp4 均在 **5703 全测试集** 上报告指标
+Large files are intentionally excluded from GitHub:
 
----
+- FinDER data files.
+- SEC 10-K HTML files.
+- HuggingFace model caches and model weights.
+- FAISS indexes, PyTorch checkpoints, and experiment outputs.
+- Local paper PDFs and zip archives.
 
-## 实验结果
+These are ignored by `.gitignore` and should be downloaded or regenerated as needed.
 
-### Exp1 — 纯检索 Baseline
+## Environment
 
-| 方法 | R@5 | **R@10** | MRR | nDCG@10 |
-|------|-----|---------|-----|---------|
-| BM25 | 0.135 | 0.167 | 0.131 | 0.122 |
-| Dense | 0.160 | 0.198 | 0.145 | 0.143 |
-| **Hybrid** | **0.200** | **0.244** | **0.184** | **0.179** |
+Create an environment and install dependencies:
 
----
-
-### Exp2 — 错误类型分析
-
-| 错误类型 | Hybrid 数量 |
-|----------|------------:|
-| **Missing Evidence** | 4030 |
-| Wrong Metric | 423 |
-| Wrong Company | 155 |
-| Wrong Year | 98 |
-
-失败以「top-10 完全未命中 gold 证据」为主（约 84%）。
-
----
-
-### Exp3 — Financial Evidence Graph + PPR
-
-| 方法 | MRR | **R@10** |
-|------|-----|---------|
-| Hybrid | 0.179 | 0.244 |
-| Semantic + PPR | 0.179 | 0.244 |
-| Financial + PPR | 0.177 | 0.244 |
-| Full + PPR | 0.177 | 0.244 |
-| Full + PPR + Constraint | 0.176 | 0.244 |
-
-PPR 在候选子图上运行并与 Hybrid 检索分融合；R@10 与 Hybrid 一致，MRR 基本持平。
-
----
-
-### Exp4 — GNN Reranker（GraphSAGE，50 epoch，5703 全测试）
-
-| 方法 | MRR | R@5 | **R@10** | nDCG@10 |
-|------|-----|-----|---------|---------|
-| Hybrid | 0.179 | 0.200 | 0.244 | 0.179 |
-| Hybrid + PPR | 0.178 | 0.200 | 0.244 | 0.178 |
-| **Hybrid + GraphSAGE** | 0.172 | 0.206 | **0.253** | 0.178 |
-
-训练 Loss：0.479 → 0.278（−42%）。GraphSAGE **R@10=0.253**，比 Hybrid 高 +0.9pp。
-
----
-
-### 跨实验总表（5703 全测试）
-
-| 方法 | MRR | **R@10** | 实验 |
-|------|-----|---------|------|
-| BM25 | 0.131 | 0.167 | Exp1 |
-| Dense | 0.145 | 0.198 | Exp1 |
-| Hybrid | **0.184** | 0.244 | Exp1 |
-| Hybrid + Full PPR | 0.177 | 0.244 | Exp3 |
-| **Hybrid + GraphSAGE** | 0.172 | **0.253** | Exp4 |
-
-| 指标 | 最佳方法 |
-|------|----------|
-| **Recall@10** | Hybrid + GraphSAGE（0.253） |
-| **MRR** | Hybrid（0.184） |
-
----
-
-## 快速开始
-
-### 1. 环境
-
-```powershell
-conda create -p ./conda-env python=3.10
-./conda-env/python.exe -m pip install -r requirements.txt
-./setup_env.ps1
+```bash
+pip install -r requirements.txt
 ```
 
+For local Windows setup, you can also use:
+
 ```powershell
-$env:HF_HOME='./cache/huggingface'
-$env:PIP_CACHE_DIR='./cache/pip'
-$env:TMP='./.tmp'
-$env:TEMP='./.tmp'
+.\setup_env.ps1
 ```
 
-### 2. 数据
+For cloud GPU setup, see:
 
-```powershell
+```bash
+bash cloud_setup.sh
+```
+
+## Data
+
+Download FinDER data:
+
+```bash
 python download_finder.py
-python extract_10k.py          # 可选：10-K 干扰项
-python check_finder.py
 ```
 
-将 `all-MiniLM-L6-v2` 放到 `cache/models/`，或在 `configs/default.yaml` 中配置 `retrieval.dense_model`。
+If you use local SEC 10-K files, place them under:
 
-### 3. 运行实验
-
-```powershell
-python experiments/exp1_retrieval_baseline.py --num_samples 0 --top_k 10
-python experiments/exp2_error_analysis.py
-python experiments/exp3_feg_ppr.py --num_samples 0 --top_n 50 --dense_device cpu
-python experiments/exp4_gnn_reranker.py --num_samples 0 --epochs 50 --no_ablation `
-  --eval_on all --dense_device cpu --device cuda
+```text
+10-k/
 ```
 
----
+## Models
 
-## 项目结构
+MiniLM, E5-Mistral, ColBERTv2, and cross-encoder weights are not committed.
 
+Expected local model paths used by the configs include:
+
+```text
+cache/models/all-MiniLM-L6-v2
+cache/models/e5-mistral-7b-instruct
+cache/models/colbertv2.0
 ```
-feg_rag/              # 核心库
-experiments/          # Exp1–4
-configs/default.yaml
-FinDER/data/          # 数据集（不入库）
-cache/                # 模型缓存（不入库）
-outputs/              # 实验输出（不入库）
+
+Download E5-Mistral helper:
+
+```bash
+python scripts/download_e5_mistral.py
 ```
 
----
+ColBERTv2 can be downloaded from HuggingFace:
 
-## 硬件说明
+```bash
+hf download colbert-ir/colbertv2.0 --local-dir cache/models/colbertv2.0
+```
 
-| GPU | 建议 |
-|-----|------|
-| 4 GB（如 3050 Ti） | `--dense_device cpu`，GNN 用 `--device cuda` |
-| 12 GB+（如 3080 Ti） | Dense + GNN 均可 GPU |
-| 云 A100 | 全 pipeline 约 35–55 min |
+## Key Experiments
 
-Exp4 全量在本机（CPU Dense）约 2–2.5 小时。
+### Table I: Initial Retrieval Comparison
 
----
+Compares BM25, Dense Retriever, Hybrid Retriever, ColBERTv2, and E5-Mistral-7B-Instruct.
 
-## 文档
+```bash
+python experiments/table1_initial_retrieval_comparison.py \
+  --config configs/table1_initial_retrieval_comparison_cloud.yaml \
+  --output_dir outputs/table1_initial_retrieval_comparison \
+  --dense_device cuda
+```
 
-- `finder_exp1_baseline_instruction.md` / `finder_all_experiments_instruction.md`
-- `financial_graph_rag_experiment_design_cn.md` / `financial_graph_rag_paper_plan_cn.md`
+For quick cloud verification, use a small sample:
 
----
+```bash
+python experiments/table1_initial_retrieval_comparison.py \
+  --config configs/table1_initial_retrieval_comparison_cloud.yaml \
+  --limit_samples 20 \
+  --output_dir outputs/table1_initial_retrieval_smoke \
+  --overwrite_output_dir \
+  --dense_device cuda
+```
 
-## License
+### E5-Mistral Standalone Retrieval
 
-Research / academic use. 公开发布前请补充 License。
+This path uses the SentenceTransformer wrapper for `e5-mistral-7b-instruct` and validates top-k outputs.
+
+```bash
+python experiments/run_e5_mistral_standalone.py \
+  --model_path cache/models/e5-mistral-7b-instruct \
+  --output_dir outputs/table1_e5_mistral_fixed \
+  --device cuda \
+  --batch_size 4 \
+  --max_seq_length 512 \
+  --max_distractor_files 50
+```
+
+### Table I: Non-LLM Reranking
+
+Runs reranking methods over the retriever candidate pool.
+
+```bash
+python experiments/table1_non_llm_reranking_comparison.py \
+  --config configs/table1_non_llm_reranking_e5_mistral.yaml \
+  --output_dir outputs/table1_non_llm_reranking \
+  --device cuda \
+  --dense_device cuda
+```
+
+### Graph-Assisted LLM Reranking
+
+```bash
+python experiments/table2_graph_assisted_llm_reranker.py \
+  --config configs/table2_graph_assisted_llm_reranker_qwen25_7b.yaml
+```
+
+### Main Generation Experiment
+
+```bash
+python experiments/table3_main_generation_qwen25_7b.py \
+  --config configs/table3_main_generation_qwen25_7b.yaml
+```
+
+## E5-Mistral Retrieval Notes
+
+`feg_rag/retrieval/dense.py` includes a dedicated E5-Mistral path:
+
+- `model_name` containing `e5-mistral` routes to `E5MistralEncoder`.
+- Queries use the instruction format:
+
+```text
+Instruct: Given a financial question, retrieve relevant evidence passages from SEC filings that directly support the answer.
+Query: {query}
+```
+
+- Passages use raw text.
+- Embeddings are normalized before FAISS `IndexFlatIP` search.
+- MiniLM and other non-E5 models keep their original behavior.
+
+## Verification Before a Full Run
+
+Run syntax checks:
+
+```bash
+python -m py_compile \
+  feg_rag/retrieval/dense.py \
+  experiments/table1_initial_retrieval_comparison.py \
+  experiments/table1_non_llm_reranking_comparison.py
+```
+
+Run smoke tests on the cloud GPU, not on a CPU-only local machine.
+
+## Results
+
+Experiment outputs are not committed to this repository. Save paper-ready results separately and include exact configs, command lines, and logs when reporting results.
+
+Do not overwrite final paper tables with suspect or partially validated historical outputs.

@@ -35,6 +35,15 @@ DEFAULTS: Dict[str, Any] = {
         "bm25_k1": 1.5,
         "bm25_b": 0.75,
         "dense_model": "sentence-transformers/all-MiniLM-L6-v2",
+        # Query instruction for E5-Mistral models
+        "dense_query_instruction": (
+            "Given a financial question, retrieve relevant evidence "
+            "passages from SEC filings that directly support the answer."
+        ),
+        # E5-Mistral specific settings
+        "e5_max_seq_length": 512,
+        "e5_batch_size": 4,
+        "debug_dense": False,
         "top_k": 50,
         "hybrid_alpha": 0.5,  # weight for BM25 vs dense
     },

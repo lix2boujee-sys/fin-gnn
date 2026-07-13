@@ -10,13 +10,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
-
-import numpy as np
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Table generators
@@ -44,8 +43,27 @@ def table1_retrieval(results: Dict[str, Dict], fmt: str = "markdown") -> str:
         "hybrid+ppr+constraint": "Hybrid + PPR + Constraint (FEG-Rerank)",
     }
 
+    aliases = {
+        "bm25": ["bm25", "BM25"],
+        "dense": ["dense", "Dense"],
+        "hybrid": ["hybrid", "Hybrid"],
+        "hybrid+cross_encoder": [
+            "hybrid+cross_encoder",
+            "hybrid+ce",
+            "Hybrid+CE",
+            "Hybrid+CrossEncoder",
+            "Hybrid+Cross-Encoder",
+        ],
+        "hybrid+ppr": ["hybrid+ppr", "Hybrid+PPR"],
+        "hybrid+ppr+constraint": [
+            "hybrid+ppr+constraint",
+            "Hybrid+PPR+Constraint",
+            "Hybrid+PPR+ConstraintScore",
+        ],
+    }
+
     for method in TABLE1_METHODS:
-        r = results.get(method, {})
+        r = _get_result(results, aliases.get(method, [method]))
         if not r:
             rows.append([method_labels.get(method, method)] + ["—"] * len(TABLE1_METRICS))
             continue
@@ -230,6 +248,8 @@ def _render_table(
     caption: str = "",
     label: str = "",
 ) -> str:
+    if fmt == "csv":
+        return _render_csv(header, rows)
     if fmt == "latex":
         return _render_latex(header, rows, caption, label)
     return _render_markdown(header, rows, caption)
@@ -245,8 +265,17 @@ def _render_markdown(header: List[str], rows: List[List[str]], caption: str) -> 
     lines.append("|" + "|".join(["---:" for _ in header]) + "|")
     # Rows
     for row in rows:
-        lines.append("| " + " | ".join(row) + " |")
+        lines.append("| " + " | ".join(_clean_cell(cell) for cell in row) + " |")
     return "\n".join(lines)
+
+
+def _render_csv(header: List[str], rows: List[List[str]]) -> str:
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(header)
+    for row in rows:
+        writer.writerow([_clean_cell(cell) for cell in row])
+    return buf.getvalue().rstrip("\n")
 
 
 def _render_latex(
@@ -268,11 +297,31 @@ def _render_latex(
     lines.append("    " + " & ".join(rf"\textbf{{{h}}}" for h in header) + r" \\")
     lines.append(r"    \midrule")
     for row in rows:
-        lines.append("    " + " & ".join(row) + r" \\")
+        lines.append("    " + " & ".join(_clean_cell(cell) for cell in row) + r" \\")
     lines.append(r"    \bottomrule")
     lines.append(r"  \end{tabular}")
     lines.append(r"\end{table}")
     return "\n".join(lines)
+
+
+def _get_result(results: Dict[str, Dict], keys: List[str]) -> Dict:
+    """Return the first matching result, accepting case-only key differences."""
+    for key in keys:
+        if key in results:
+            return results[key]
+
+    lower_results = {str(key).lower(): value for key, value in results.items()}
+    for key in keys:
+        value = lower_results.get(str(key).lower())
+        if value is not None:
+            return value
+    return {}
+
+
+def _clean_cell(cell: str) -> str:
+    if cell in {"\u2014", "鈥?", "бк"}:
+        return "-"
+    return cell
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -311,11 +360,13 @@ def main() -> None:
                         help="Path to single results JSON file")
     parser.add_argument("--results-dir", type=str, default="",
                         help="Directory of result JSON files to aggregate")
-    parser.add_argument("--format", choices=["markdown", "latex"], default="markdown",
+    parser.add_argument("--format", choices=["markdown", "latex", "csv"], default="markdown",
                         help="Output format")
     parser.add_argument("--table", type=str, default="all",
                         choices=["all", "1", "2", "3", "4", "5"],
                         help="Which table(s) to generate")
+    parser.add_argument("--output", type=str, default="",
+                        help="Optional output file for the generated table text")
     args = parser.parse_args()
 
     # Load results
@@ -345,11 +396,22 @@ def main() -> None:
         ["1", "2", "3", "4", "5"] if args.table == "all" else [args.table]
     )
 
+    chunks: List[str] = []
     for t in tables_to_generate:
-        print(f"\n{'=' * 60}")
-        print(f"Table {t}")
-        print(f"{'=' * 60}")
-        print(generators[t](all_results, fmt=args.format))
+        table_text = generators[t](all_results, fmt=args.format)
+        if args.format == "csv" and len(tables_to_generate) == 1:
+            chunks.append(table_text)
+        else:
+            chunks.append(f"{'=' * 60}\nTable {t}\n{'=' * 60}")
+            chunks.append(table_text)
+
+    output = "\n\n".join(chunks)
+    print(output)
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(output + "\n", encoding="utf-8")
+        print(f"\nWrote table to: {output_path}")
 
 
 if __name__ == "__main__":

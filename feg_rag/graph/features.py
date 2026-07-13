@@ -146,11 +146,15 @@ def build_node_features(
           f"+ match_flags=2 + degree=1)")
     print(f"  Embedding source: {embedding_source}")
 
-    # Warn if the expected neural dim (384 → 391) doesn't match
-    _EXPECTED_NEURAL_DIM = 391
-    if embedding_source not in ("none", "tfidf") and feat_dim != _EXPECTED_NEURAL_DIM:
-        print(f"  ⚠ WARNING: Feature dim is {feat_dim}, expected {_EXPECTED_NEURAL_DIM} "
-              f"for local MiniLM (384-dim). Check your embedding backend!")
+    # Warn if the feature dim looks unusual for the actual embedding dimension.
+    # The expected feature dim is: embedding_dim + 1 (retrieval score)
+    # + num_types (node type one-hot) + 2 (match flags) + 1 (degree).
+    _expected_feat_dim = embedding_dim + 1 + num_types + 2 + 1
+    if embedding_source not in ("none", "tfidf") and feat_dim != _expected_feat_dim:
+        print(f"  ⚠ WARNING: Feature dim is {feat_dim}, expected "
+              f"{_expected_feat_dim} "
+              f"({embedding_dim} + 1 + {num_types} + 2 + 1). "
+              f"Check your embedding backend / node type encoding!")
 
     # Pre-compute degree
     degrees = dict(graph.graph.degree())

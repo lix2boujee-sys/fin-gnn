@@ -102,7 +102,13 @@ def main() -> None:
     if args.retriever == "hybrid":
         from feg_rag.retrieval.dense import DenseRetriever
         from feg_rag.retrieval.hybrid import HybridRetriever
-        dense = DenseRetriever(model_name=cfg.retrieval["dense_model"])
+        dense = DenseRetriever(
+            model_name=cfg.retrieval["dense_model"],
+            query_instruction=cfg.retrieval.get("dense_query_instruction"),
+            e5_max_seq_length=cfg.retrieval.get("e5_max_seq_length", 512),
+            e5_batch_size=cfg.retrieval.get("e5_batch_size"),
+            debug=cfg.retrieval.get("debug_dense", False),
+        )
         dense.index(corpus_chunks)
         retriever = HybridRetriever(bm25, dense, alpha=cfg.retrieval["hybrid_alpha"])
     else:

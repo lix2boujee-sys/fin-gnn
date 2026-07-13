@@ -223,7 +223,13 @@ def main() -> None:
     t0 = time.time()
     if not args.skip_dense:
         print("  Dense index (downloading model if needed)...")
-        dense = DenseRetriever(model_name=cfg.retrieval["dense_model"])
+        dense = DenseRetriever(
+            model_name=cfg.retrieval["dense_model"],
+            query_instruction=cfg.retrieval.get("dense_query_instruction"),
+            e5_max_seq_length=cfg.retrieval.get("e5_max_seq_length", 512),
+            e5_batch_size=cfg.retrieval.get("e5_batch_size"),
+            debug=cfg.retrieval.get("debug_dense", False),
+        )
         dense.index(corpus_chunks)
         print(f"    {time.time() - t0:.1f}s")
     else:

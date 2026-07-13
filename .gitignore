@@ -5,14 +5,38 @@ conda-env/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
 # Cache & outputs
 cache/
 outputs/
+fin-gnn_outputs/
+wandb/
+runs/
+logs/
 
 # Data (large files)
 FinDER/
 10-k/
+*.parquet
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Model weights / indexes / checkpoints
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.faiss
+*.npy
+*.npz
+
+# Paper drafts and local scratch files
+*.pdf
+tmp_*
 
 # API keys & secrets
 .env

@@ -1,0 +1,43 @@
+# FEG-RAG E5-Mistral experiment configuration
+# Inherits the same structure as default.yaml but uses the E5-Mistral
+# dense encoder (4096-dim) instead of all-MiniLM-L6-v2 (384-dim).
+#
+# Usage:
+#   python experiments/exp1_retrieval_baseline.py --config configs/e5_mistral.yaml ...
+#   python experiments/exp3_feg_ppr.py            --config configs/e5_mistral.yaml ...
+#   python experiments/exp4_gnn_reranker.py       --config configs/e5_mistral.yaml ...
+
+root_dir: "D:/fin-gnn"
+data_dir: "FinDER/data"
+edgar_dir: "10-k"
+output_dir: "outputs"
+cache_dir: "cache"
+
+datasets:
+  - finder
+
+chunk_size: 512
+chunk_overlap: 64
+
+retrieval:
+  dense_model: "D:/fin-gnn/cache/models/e5-mistral-7b-instruct"
+  # Query instruction for E5-Mistral models
+  dense_query_instruction: "Given a financial question, retrieve relevant evidence passages from SEC filings that directly support the answer."
+  # E5-Mistral specific settings (4096-dim, decoder-only LLM)
+  e5_max_seq_length: 512
+  e5_batch_size: 4
+  debug_dense: false
+  top_k: 50
+  hybrid_alpha: 0.5
+
+graph:
+  node_types:
+    - chunk
+    - metric
+    - year
+
+rerank:
+  gnn_model: "sage"  # sage | rgcn
+
+evaluation:
+  recall_k_values: [1, 3, 5, 10, 20]

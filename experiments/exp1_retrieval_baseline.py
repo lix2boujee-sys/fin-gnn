@@ -231,6 +231,9 @@ def write_readme(
     alpha: float,
     top_k: int,
     dense_backend: str = "sentence-transformers",
+    dense_device: str = "cpu",
+    dense_batch_size: str = "auto",
+    command: str = "",
 ) -> None:
     best = max(
         summaries.items(),
@@ -244,11 +247,7 @@ def write_readme(
         "## Run command",
         "",
         "```bash",
-        "python experiments/exp1_retrieval_baseline.py \\",
-        f"  --config configs/default.yaml \\",
-        f"  --output_dir outputs/exp1_baseline \\",
-        f"  --top_k {top_k} \\",
-        f"  --alpha {alpha}",
+        f"{command or '# (see train_config.yaml for full command)'}",
         "```",
         "",
         "## Data mapping (FinDER → code)",
@@ -268,6 +267,8 @@ def write_readme(
         "",
         f"- Dense model: `{cfg.retrieval['dense_model']}`",
         f"- Dense backend used: `{dense_backend}`",
+        f"- Dense device: `{dense_device}`",
+        f"- Dense batch size: `{dense_batch_size}`",
         f"- Hybrid alpha (BM25 weight): `{alpha}`",
         f"- Retrieval top_k: `{top_k}`",
         f"- Samples evaluated: `{num_samples}`",
@@ -326,6 +327,13 @@ def main() -> None:
     parser.add_argument("--max_distractor_files", type=int, default=50)
     parser.add_argument("--skip_dense", action="store_true",
                         help="Skip dense/hybrid (BM25 only, for debugging)")
+    parser.add_argument("--dense_device", default="cpu",
+                        help="Device for Dense encoding (cpu avoids GPU OOM)")
+    parser.add_argument("--dense_batch_size", type=int, default=None,
+                        help="Batch size for dense encoding (default: auto; "
+                             "use 1-4 for E5-Mistral on CPU)")
+    parser.add_argument("--overwrite_output_dir", action="store_true",
+                        help="Allow overwriting existing results")
     args = parser.parse_args()
 
     cfg = Config.from_yaml(args.config)
@@ -370,8 +378,15 @@ def main() -> None:
     if not args.skip_dense:
         t0 = time.time()
         try:
-            dense = DenseRetriever(model_name=cfg.retrieval["dense_model"])
-            dense.index(corpus_chunks)
+            dense = DenseRetriever(
+                model_name=cfg.retrieval["dense_model"],
+                device=args.dense_device,
+                query_instruction=cfg.retrieval.get("dense_query_instruction"),
+                e5_max_seq_length=cfg.retrieval.get("e5_max_seq_length", 512),
+                e5_batch_size=cfg.retrieval.get("e5_batch_size"),
+                debug=cfg.retrieval.get("debug_dense", False),
+            )
+            dense.index(corpus_chunks, batch_size=args.dense_batch_size)
             dense_backend = getattr(dense, "backend", "sentence-transformers")
             print(f"  Dense ({dense_backend}) indexed in {time.time() - t0:.1f}s")
         except Exception as exc:
@@ -446,6 +461,9 @@ def main() -> None:
         alpha,
         args.top_k,
         dense_backend=dense_backend if dense is not None else "skipped",
+        dense_device=args.dense_device,
+        dense_batch_size=str(args.dense_batch_size or "auto"),
+        command=" ".join(sys.argv),
     )
 
     # Print table
