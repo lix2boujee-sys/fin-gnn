@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from feg_rag.config import Config
-from feg_rag.data.chunker import Chunk, chunk_text
+from feg_rag.data.chunker import Chunk
+from feg_rag.data.corpus import build_benchmark_corpus
 from feg_rag.graph.builder import FinancialEvidenceGraph
 from feg_rag.graph.features import build_node_features
 from feg_rag.rerank.gnn import GNNFusionReranker, GraphSAGEReranker, RerankDataset
@@ -22,17 +23,17 @@ Retriever = Union[BM25Retriever, HybridRetriever]
 def build_corpus(
     samples: List[Dict],
     cfg: Config,
+    allow_gold_only_corpus: bool | None = None,
 ) -> Tuple[List[Chunk], Dict[str, List[str]]]:
-    """Chunk evidence texts and build gold evidence map."""
-    corpus: List[Chunk] = []
-    gold_map: Dict[str, List[str]] = {}
-    for s in samples:
-        gold_ids: List[str] = []
-        for text in s["evidence_texts"]:
-            for c in chunk_text(text, cfg.chunk_size, cfg.chunk_overlap, doc_id=s["id"]):
-                corpus.append(c)
-                gold_ids.append(c.chunk_id)
-        gold_map[s["id"]] = gold_ids
+    """Build document corpus and align gold evidence to corpus chunk IDs."""
+    corpus, gold_map, alignments = build_benchmark_corpus(
+        samples,
+        cfg,
+        allow_gold_only_corpus=allow_gold_only_corpus,
+    )
+    failed = [a for a in alignments if not a.matched_chunk_ids]
+    if failed:
+        print(f"  [WARN] Gold alignment failed for {len(failed)} evidence snippets")
     return corpus, gold_map
 
 

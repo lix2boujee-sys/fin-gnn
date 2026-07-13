@@ -12,8 +12,20 @@ datasets:
   # - tatqa
   # - finqa
 
+# Optional. Set to train/dev/test or provide explicit file names to avoid
+# accidentally mixing splits when multiple parquet files are present.
+data_split:
+data_files:
+
 chunk_size: 512
 chunk_overlap: 64
+
+# Benchmark corpus must come from source documents under edgar_dir.
+# Gold-only corpus is debug-only and must be enabled explicitly.
+allow_gold_only_corpus: false
+corpus:
+  allow_gold_only_corpus: false
+  max_doc_files:
 
 retrieval:
   dense_model: "D:/fin-gnn/cache/models/all-MiniLM-L6-v2"

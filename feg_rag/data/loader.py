@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 
@@ -43,7 +43,11 @@ def load_dataset(name: str, data_dir: str | Path, **kwargs) -> List[Dict]:
 # FinDER
 # ═════════════════════════════════════════════════════════════════════════════
 
-def load_finder(data_dir: Path, split: Optional[str] = None) -> List[Dict]:
+def load_finder(
+    data_dir: Path,
+    split: Optional[str] = None,
+    files: Optional[Iterable[str | Path]] = None,
+) -> List[Dict]:
     """Load FinDER from parquet files.
 
     FinDER columns: _id, text (question), answer, references (evidence), type,
@@ -52,9 +56,10 @@ def load_finder(data_dir: Path, split: Optional[str] = None) -> List[Dict]:
     Returns uniform samples with:
         id, question, answer, evidence_texts, metadata
     """
-    parquet_files = sorted(data_dir.glob("*.parquet"))
+    parquet_files = _resolve_finder_files(data_dir, split=split, files=files)
     if not parquet_files:
-        raise FileNotFoundError(f"No parquet files in {data_dir}")
+        split_msg = f" for split '{split}'" if split else ""
+        raise FileNotFoundError(f"No FinDER parquet files{split_msg} in {data_dir}")
 
     samples: List[Dict] = []
     for pf in parquet_files:
@@ -83,6 +88,37 @@ def load_finder(data_dir: Path, split: Optional[str] = None) -> List[Dict]:
                 }
             )
     return samples
+
+
+def _resolve_finder_files(
+    data_dir: Path,
+    split: Optional[str] = None,
+    files: Optional[Iterable[str | Path]] = None,
+) -> List[Path]:
+    if files:
+        resolved = []
+        for item in files:
+            p = Path(item)
+            if not p.is_absolute():
+                p = data_dir / p
+            resolved.append(p)
+        missing = [str(p) for p in resolved if not p.exists()]
+        if missing:
+            raise FileNotFoundError(f"FinDER files not found: {missing}")
+        return sorted(resolved)
+
+    if split:
+        patterns = [
+            f"{split}.parquet",
+            f"{split}-*.parquet",
+            f"*{split}*.parquet",
+        ]
+        matched: List[Path] = []
+        for pattern in patterns:
+            matched.extend(data_dir.glob(pattern))
+        return sorted(set(matched))
+
+    return sorted(data_dir.glob("*.parquet"))
 
 
 # ═════════════════════════════════════════════════════════════════════════════

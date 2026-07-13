@@ -31,8 +31,18 @@ edgar_dir: "10-k"
 output_dir: "outputs/table1_initial_retrieval_comparison"
 cache_dir: "cache"
 
+data_split:
+data_files:
+
 chunk_size: 512
 chunk_overlap: 64
+
+# Default benchmark mode: build corpus from full 10-K/documents under edgar_dir.
+# Do not enable gold-only corpus for paper results.
+allow_gold_only_corpus: false
+corpus:
+  allow_gold_only_corpus: false
+  max_doc_files:
 
 retrieval:
   top_k: 50

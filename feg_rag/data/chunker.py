@@ -7,10 +7,11 @@ consume.
 from __future__ import annotations
 
 import re
-import uuid
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
+from html import unescape
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -45,8 +46,10 @@ def chunk_text(
     filing_type: str = "",
     filing_year: str = "",
     section: str = "",
+    stable_id_prefix: str = "",
 ) -> List[Chunk]:
     """Split plain text into overlapping chunks by word boundaries."""
+    _validate_chunk_params(chunk_size, chunk_overlap)
     chunks: List[Chunk] = []
     words = text.split()
     if not words:
@@ -57,9 +60,16 @@ def chunk_text(
         end = min(start + chunk_size, len(words))
         chunk_words = words[start:end]
         chunk_text = " ".join(chunk_words)
+        chunk_id = _stable_chunk_id(
+            chunk_type="chunk",
+            doc_id=doc_id or stable_id_prefix,
+            section=section,
+            offset=start,
+            text=chunk_text,
+        )
         chunks.append(
             Chunk(
-                chunk_id=_uid(),
+                chunk_id=chunk_id,
                 text=chunk_text,
                 chunk_type="text",
                 doc_id=doc_id,
@@ -89,6 +99,8 @@ def chunk_table_markdown(
 
     Keeps the header row in every chunk so each chunk is self-contained.
     """
+    if max_rows_per_chunk <= 0:
+        raise ValueError("max_rows_per_chunk must be > 0")
     lines = markdown_table.strip().split("\n")
     if len(lines) < 2:
         return []
@@ -100,9 +112,16 @@ def chunk_table_markdown(
     for i in range(0, len(body), max_rows_per_chunk):
         block = body[i : i + max_rows_per_chunk]
         chunk_text = "\n".join(header + block)
+        chunk_id = _stable_chunk_id(
+            chunk_type="table",
+            doc_id=doc_id,
+            section=section,
+            offset=i,
+            text=chunk_text,
+        )
         chunks.append(
             Chunk(
-                chunk_id=_uid(),
+                chunk_id=chunk_id,
                 text=chunk_text,
                 chunk_type="table",
                 doc_id=doc_id,
@@ -128,6 +147,8 @@ def chunk_report(
     ``AAPL_2023_10K.txt``.
     """
     raw = report_path.read_text(encoding="utf-8", errors="replace")
+    if report_path.suffix.lower() in {".html", ".htm"}:
+        raw = _html_to_text(raw)
     doc_id = report_path.stem
 
     # Parse filing metadata from filename
@@ -193,5 +214,44 @@ def _split_sections(text: str) -> List[Tuple[str, str]]:
     return sections
 
 
-def _uid() -> str:
-    return uuid.uuid4().hex[:12]
+def _validate_chunk_params(chunk_size: int, chunk_overlap: int) -> None:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if chunk_overlap < 0:
+        raise ValueError("chunk_overlap must be >= 0")
+    if chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be smaller than chunk_size")
+
+
+def _html_to_text(text: str) -> str:
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", text)
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\s*>", "\n", text)
+    text = re.sub(r"(?i)</div\s*>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return unescape(re.sub(r"[ \t]+", " ", text))
+
+
+def _stable_chunk_id(
+    chunk_type: str,
+    doc_id: str = "",
+    section: str = "",
+    offset: int = 0,
+    text: str = "",
+) -> str:
+    safe_doc = _safe_id(doc_id) or "no-doc"
+    safe_section = _safe_id(section) or "no-section"
+    text_hash = hashlib.sha1(_normalize_for_id(text).encode("utf-8")).hexdigest()[:10]
+    return f"{chunk_type}::{safe_doc}::{safe_section}::{offset}::{text_hash}"
+
+
+def _safe_id(value: str) -> str:
+    value = str(value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9._-]+", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-")
+    return value[:80]
+
+
+def _normalize_for_id(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())

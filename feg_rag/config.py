@@ -27,9 +27,17 @@ DEFAULTS: Dict[str, Any] = {
     "cache_dir": "cache",
     # ---- data ----
     "datasets": ["finder"],  # finder, tatqa, finqa
+    "data_split": None,
+    "data_files": None,
     "chunk_size": 512,
     "chunk_overlap": 64,
     "max_chunks_per_doc": 200,
+    "allow_gold_only_corpus": False,
+    "corpus": {
+        "allow_gold_only_corpus": False,
+        # Optional cap for debugging. Leave null/omitted for full corpus.
+        "max_doc_files": None,
+    },
     # ---- retrieval ----
     "retrieval": {
         "bm25_k1": 1.5,

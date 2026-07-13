@@ -22,7 +22,8 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from feg_rag.config import Config
-from feg_rag.data.chunker import Chunk, chunk_text, chunk_report
+from feg_rag.data.chunker import Chunk
+from feg_rag.data.corpus import build_benchmark_corpus
 from feg_rag.data.hard_negatives import generate_hard_negatives
 from feg_rag.data.loader import load_dataset
 from feg_rag.evaluation.error_analysis import ErrorAnalyzer
@@ -64,57 +65,45 @@ class Pipeline:
     # Step 1: Data loading & chunking
     # ------------------------------------------------------------------
 
-    def step_data(self) -> Tuple[List[Dict], List[Chunk], Dict[str, List[str]]]:
+    def step_data(
+        self,
+        split: str | None = None,
+        num_samples: int = 0,
+    ) -> Tuple[List[Dict], List[Chunk], Dict[str, List[str]]]:
         """Load dataset, build chunks, map gold evidence."""
-        cache = self.cfg.cache_dir / "data_state.json"
-        if cache.exists():
-            print("[data] Loading from cache...")
-            return self._load_data_cache()
-
         print("[data] Loading datasets...")
         all_samples: List[Dict] = []
         for ds_name in self.cfg.datasets:
             try:
-                samples = load_dataset(ds_name, self.cfg.data_dir)
+                samples = load_dataset(
+                    ds_name,
+                    self.cfg.data_dir,
+                    split=split or self.cfg._raw.get("data_split"),
+                    files=self.cfg._raw.get("data_files"),
+                )
                 all_samples.extend(samples)
                 print(f"  {ds_name}: {len(samples)} samples")
             except FileNotFoundError as e:
                 print(f"  [SKIP] {ds_name}: {e}")
 
         print(f"[data] Total: {len(all_samples)} QA samples")
+        if num_samples > 0:
+            all_samples = all_samples[:num_samples]
+            print(f"[data] Limited to {len(all_samples)} QA samples")
+        if not all_samples:
+            raise RuntimeError("No QA samples loaded; check data_dir/data_split/data_files.")
 
-        # Build chunks
-        print("[data] Chunking evidence texts...")
-        corpus_chunks: List[Chunk] = []
-        gold_map: Dict[str, List[str]] = {}
-
-        for s in all_samples:
-            gold_ids = []
-            for text in s["evidence_texts"]:
-                for c in chunk_text(
-                    text,
-                    self.cfg.chunk_size,
-                    self.cfg.chunk_overlap,
-                    doc_id=s["id"],
-                ):
-                    corpus_chunks.append(c)
-                    gold_ids.append(c.chunk_id)
-            gold_map[s["id"]] = gold_ids
-
-        # Add 10-K distractors
-        edgar_dir = self.cfg.edgar_dir
-        if edgar_dir.exists():
-            txt_files = list(edgar_dir.rglob("*.txt"))
-            print(f"[data] Chunking {len(txt_files)} 10-K reports as distractors...")
-            for tf in txt_files[:10]:  # cap for speed
-                try:
-                    corpus_chunks.extend(
-                        chunk_report(tf, self.cfg.chunk_size, self.cfg.chunk_overlap)
-                    )
-                except Exception:
-                    pass
+        print("[data] Building document corpus and aligning gold evidence...")
+        corpus_chunks, gold_map, alignments = build_benchmark_corpus(
+            all_samples, self.cfg
+        )
 
         print(f"[data] Corpus: {len(corpus_chunks)} total chunks")
+        print(f"[data] Alignment records: {len(alignments)}")
+        if not corpus_chunks:
+            raise RuntimeError("Empty corpus; check edgar_dir and corpus settings.")
+        if not any(gold_map.values()):
+            raise RuntimeError("No gold evidence matched to corpus chunks.")
 
         self._save_data_cache(all_samples, corpus_chunks, gold_map)
         self._state["samples"] = all_samples
@@ -359,8 +348,8 @@ class Pipeline:
             json.dump(cache, fh, indent=2)
 
     def _load_data_cache(self) -> Tuple[List, List, Dict]:
-        """Loading from cache requires re-running data step; stub here."""
-        raise RuntimeError("Full cache restore not implemented; re-run data step.")
+        """Data cache restore is intentionally disabled."""
+        return self.step_data()
 
 
 def _timestamp() -> str:
@@ -394,6 +383,8 @@ def main() -> None:
     )
     parser.add_argument("--num_samples", type=int, default=0,
                         help="Limit QA samples (0=all).")
+    parser.add_argument("--split", default=None,
+                        help="Dataset split to load, e.g. train/dev/test.")
     args = parser.parse_args()
 
     # Determine which steps to run
@@ -411,9 +402,9 @@ def main() -> None:
     gen_results = None
 
     if "data" in steps_to_run:
-        samples, corpus_chunks, gold_map = pipeline.step_data()
-        if args.num_samples > 0:
-            samples = samples[: args.num_samples]
+        samples, corpus_chunks, gold_map = pipeline.step_data(
+            split=args.split, num_samples=args.num_samples
+        )
     else:
         raise RuntimeError("Data step is required (must be first).")
 

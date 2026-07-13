@@ -46,7 +46,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from feg_rag.config import Config
-from feg_rag.data.chunker import Chunk, chunk_text, chunk_report
+from feg_rag.data.chunker import Chunk
+from feg_rag.data.corpus import build_benchmark_corpus
 from feg_rag.data.loader import load_dataset
 from feg_rag.evaluation.metrics import compute_all_metrics
 from feg_rag.retrieval.bm25 import BM25Retriever
@@ -126,25 +127,18 @@ _HISTORY_LABEL_MAP = {
 def _build_corpus(
     samples: List[Dict],
     cfg: Config,
-    max_distractor_files: int = 50,
+    max_distractor_files: int | None = None,
+    allow_gold_only_corpus: bool = False,
 ) -> Tuple[List[Chunk], Dict[str, List[str]]]:
-    corpus: List[Chunk] = []
-    gold_map: Dict[str, List[str]] = {}
-    for s in samples:
-        gold_ids = []
-        for text in s["evidence_texts"]:
-            for c in chunk_text(text, cfg.chunk_size, cfg.chunk_overlap, doc_id=s["id"]):
-                corpus.append(c)
-                gold_ids.append(c.chunk_id)
-        gold_map[s["id"]] = gold_ids
-    edgar_dir = cfg.edgar_dir
-    if edgar_dir.exists():
-        txt_files = list(edgar_dir.rglob("*.txt")) or list(edgar_dir.rglob("*.html"))
-        for tf in txt_files[:max_distractor_files]:
-            try:
-                corpus.extend(chunk_report(tf, cfg.chunk_size, cfg.chunk_overlap))
-            except Exception:
-                pass
+    corpus, gold_map, alignments = build_benchmark_corpus(
+        samples,
+        cfg,
+        max_doc_files=max_distractor_files,
+        allow_gold_only_corpus=allow_gold_only_corpus,
+    )
+    failed = [a for a in alignments if not a.matched_chunk_ids]
+    if failed:
+        print(f"  [WARN] Gold alignment failed for {len(failed)} evidence snippets")
     return corpus, gold_map
 
 
@@ -687,6 +681,8 @@ def main() -> None:
     p.add_argument("--output_dir", default=None)
     p.add_argument("--num_samples", type=int, default=0)
     p.add_argument("--limit_samples", type=int, default=0)
+    p.add_argument("--split", default=None,
+                   help="Dataset split to load, e.g. train/dev/test.")
     p.add_argument("--dense_device", default="cpu")
     p.add_argument("--dense_batch_size", type=int, default=None)
     p.add_argument("--e5_batch_size", type=int, default=None)
@@ -699,6 +695,7 @@ def main() -> None:
     p.add_argument("--reuse_baseline_dir", default=None)
     p.add_argument("--allow_suspect_history", action="store_true", default=False)
     p.add_argument("--allow_na_recall50", action="store_true", default=False)
+    p.add_argument("--allow_gold_only_corpus", action="store_true", default=False)
     p.add_argument("--overwrite_output_dir", action="store_true")
     args = p.parse_args()
 
@@ -744,19 +741,32 @@ def main() -> None:
 
     # ── 1. Load data ────────────────────────────────────────────────────
     print("\n[1/5] Loading FinDER data ...")
-    samples = load_dataset("finder", cfg.data_dir)
+    samples = load_dataset(
+        "finder",
+        cfg.data_dir,
+        split=args.split or cfg._raw.get("data_split"),
+        files=cfg._raw.get("data_files"),
+    )
     if num_samples > 0:
         samples = samples[:num_samples]
+    if not samples:
+        raise RuntimeError("No FinDER samples loaded; check data_dir/split/data_files.")
     sample_ids = {s["id"] for s in samples}
     print(f"  {len(samples)} samples")
 
     # ── 2. Build corpus ─────────────────────────────────────────────────
     print("[2/5] Building corpus ...")
-    corpus_chunks, gold_map = _build_corpus(samples, cfg)
+    corpus_chunks, gold_map = _build_corpus(
+        samples, cfg, allow_gold_only_corpus=args.allow_gold_only_corpus
+    )
     corpus_chunk_ids = {c.chunk_id for c in corpus_chunks}
     gold_ids = {cid for gids in gold_map.values() for cid in gids}
     print(f"  {len(corpus_chunks)} chunks ({len(gold_ids)} gold, "
           f"{len(corpus_chunks) - len(gold_ids)} distractors)")
+    if not corpus_chunks:
+        raise RuntimeError("Empty retrieval corpus; check edgar_dir/corpus settings.")
+    if not any(gold_map.values()):
+        raise RuntimeError("No gold evidence matched to corpus chunks.")
 
     # ── 3. Load history FIRST — before any index building ───────────────
     print("\n[3/5] Loading historical results ...")

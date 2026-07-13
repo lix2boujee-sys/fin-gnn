@@ -6,6 +6,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+pytest-cache-files-*
+pytest-tmp/
+tests/_tmp/
+tests/_runtime/
 
 # Cache & outputs
 cache/
