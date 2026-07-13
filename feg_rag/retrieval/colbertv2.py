@@ -16,10 +16,11 @@ index path is recorded so subsequent runs can locate and reuse the index.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from feg_rag.data.chunker import Chunk
 
@@ -125,6 +126,10 @@ class ColBERTv2Retriever:
         return self.index_dir / "pid_to_chunk_id.json"
 
     @property
+    def manifest_path(self) -> Path:
+        return self.index_dir / "collection_manifest.json"
+
+    @property
     def is_indexed(self) -> bool:
         """Check whether a complete ColBERT index exists on disk.
 
@@ -183,12 +188,20 @@ class ColBERTv2Retriever:
         self._chunks = chunks
 
         if self.is_indexed and not force_rebuild:
+            if self._cache_matches_chunks(chunks):
+                if verbose:
+                    rpath = self.resolved_index_path or self.index_dir
+                    print(f"  [ColBERT] Loading cached index from {rpath}")
+                self._load_pid_map()
+                self._init_searcher()
+                return
+
             if verbose:
-                rpath = self.resolved_index_path or self.index_dir
-                print(f"  [ColBERT] Loading cached index from {rpath}")
-            self._load_pid_map()
-            self._init_searcher()
-            return
+                print(
+                    "  [ColBERT] Existing index does not match current corpus "
+                    "or ColBERT settings; rebuilding."
+                )
+            shutil.rmtree(self.index_dir)
 
         if force_rebuild and self.index_dir.exists():
             if verbose:
@@ -267,6 +280,7 @@ class ColBERTv2Retriever:
                     f"under {self.index_dir}.  Searcher may fail."
                 )
 
+        self._write_manifest(chunks)
         self._init_searcher()
         if verbose:
             print(f"  [ColBERT] Index ready: {self.index_dir}")
@@ -364,6 +378,66 @@ class ColBERTv2Retriever:
             raw = json.load(fh)
         self._pid_to_chunk_id = {int(k): v for k, v in raw.items()}
         self._chunk_id_to_pid = {v: int(k) for k, v in raw.items()}
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return " ".join((text or "").split())
+
+    @staticmethod
+    def _sha1(text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+    def _manifest_for_chunks(self, chunks: List[Chunk]) -> Dict[str, Any]:
+        chunk_hasher = hashlib.sha1()
+        text_hasher = hashlib.sha1()
+        for pid, chunk in enumerate(chunks):
+            text_hash = self._sha1(self._normalize_text(chunk.text))
+            chunk_hasher.update(
+                f"{pid}\t{chunk.chunk_id}\t{text_hash}\n".encode("utf-8")
+            )
+            text_hasher.update(f"{pid}\t{text_hash}\n".encode("utf-8"))
+
+        return {
+            "version": 1,
+            "chunk_count": len(chunks),
+            "first_chunk_id": chunks[0].chunk_id if chunks else None,
+            "last_chunk_id": chunks[-1].chunk_id if chunks else None,
+            "chunk_sequence_sha1": chunk_hasher.hexdigest(),
+            "text_sequence_sha1": text_hasher.hexdigest(),
+            "checkpoint": str(self.checkpoint),
+            "nbits": self.nbits,
+            "doc_maxlen": self.doc_maxlen,
+            "query_maxlen": self.query_maxlen,
+        }
+
+    def _write_manifest(self, chunks: List[Chunk]) -> None:
+        with open(self.manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(self._manifest_for_chunks(chunks), fh, indent=2, ensure_ascii=False)
+
+    def _cache_matches_chunks(self, chunks: List[Chunk]) -> bool:
+        """Return True only when the cached index was built for these chunks."""
+        if not self.manifest_path.exists():
+            return False
+        try:
+            with open(self.manifest_path, "r", encoding="utf-8") as fh:
+                cached = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        expected = self._manifest_for_chunks(chunks)
+        keys = (
+            "version",
+            "chunk_count",
+            "first_chunk_id",
+            "last_chunk_id",
+            "chunk_sequence_sha1",
+            "text_sequence_sha1",
+            "checkpoint",
+            "nbits",
+            "doc_maxlen",
+            "query_maxlen",
+        )
+        return all(cached.get(k) == expected.get(k) for k in keys)
 
     def _init_searcher(self) -> None:
         """Initialize the ColBERT Searcher for an existing index."""
