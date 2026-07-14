@@ -117,6 +117,10 @@ _HISTORY_LABEL_MAP = {
     "bm25": "bm25", "BM25": "bm25",
     "dense": "dense", "Dense": "dense", "Dense Retrieval": "dense",
     "hybrid": "hybrid", "Hybrid": "hybrid", "Hybrid (BM25 + Dense)": "hybrid",
+    "colbertv2": "colbertv2", "colbert": "colbertv2", "ColBERTv2": "colbertv2",
+    "e5_mistral": "e5_mistral",
+    "e5-mistral-7b-instruct": "e5_mistral",
+    "E5-Mistral-7B-Instruct": "e5_mistral",
 }
 
 
@@ -396,6 +400,49 @@ def _load_history(
         print(f"      OK: {len(results)} records (reused)")
 
     return loaded, needs_rerun
+
+
+def _load_resume_results(
+    output_dir: Path,
+    expected_num_samples: int,
+    corpus_chunk_ids: Set[str],
+    sample_ids: Set[str],
+    require_top_k: int,
+) -> Dict[str, List[Dict]]:
+    """Load already completed method jsonl files from the current output dir."""
+    loaded: Dict[str, List[Dict]] = {}
+    if not output_dir.exists():
+        return loaded
+
+    print(f"\n  [resume] Checking existing outputs in: {output_dir}")
+    for method in METHOD_ORDER:
+        fname = METHOD_FILES.get(method, f"{method}_results.jsonl")
+        jp = output_dir / fname
+        if not jp.exists():
+            continue
+
+        results, warnings, topk_bad = _validate_and_load_jsonl(
+            jp, method, expected_num_samples, require_top_k=require_top_k,
+        )
+        for w in warnings:
+            print(f"    [{method}] [WARN] {w}")
+        if not results or topk_bad:
+            print(f"    [{method}] existing file is incomplete; will rerun")
+            continue
+
+        sanity = _sanity_check_history_results(
+            results, method, corpus_chunk_ids, sample_ids
+        )
+        for w in sanity:
+            print(f"    [{method}] [WARN] sanity: {w}")
+        loaded[method] = results
+        _PROVENANCE[method] = {
+            "source": "resumed",
+            "source_dir": str(output_dir.resolve()),
+            "source_file": fname,
+        }
+        print(f"    [{method}] resumed {len(results)} records")
+    return loaded
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -696,6 +743,8 @@ def main() -> None:
     p.add_argument("--allow_suspect_history", action="store_true", default=False)
     p.add_argument("--allow_na_recall50", action="store_true", default=False)
     p.add_argument("--allow_gold_only_corpus", action="store_true", default=False)
+    p.add_argument("--resume", action="store_true",
+                   help="Reuse completed method jsonl files from output_dir.")
     p.add_argument("--overwrite_output_dir", action="store_true")
     args = p.parse_args()
 
@@ -705,8 +754,8 @@ def main() -> None:
     output_dir = Path(args.output_dir or cfg.output_dir)
     if not output_dir.is_absolute():
         output_dir = cfg.root_dir / output_dir
-    if _has_results(output_dir) and not args.overwrite_output_dir:
-        print(f"\nERROR: '{output_dir}' has results. Use --overwrite_output_dir.")
+    if _has_results(output_dir) and not args.overwrite_output_dir and not args.resume:
+        print(f"\nERROR: '{output_dir}' has results. Use --overwrite_output_dir or --resume.")
         sys.exit(1)
 
     num_samples = args.num_samples or args.limit_samples
@@ -738,6 +787,7 @@ def main() -> None:
     print(f"  Skip:            bm25={args.skip_bm25} dense={args.skip_dense} "
           f"hybrid={args.skip_hybrid} colbert={args.skip_colbert}")
     print(f"  Reuse:           {args.reuse_baseline_dir or 'none'}")
+    print(f"  Resume:          {args.resume}")
 
     # ── 1. Load data ────────────────────────────────────────────────────
     print("\n[1/5] Loading FinDER data ...")
@@ -806,13 +856,24 @@ def main() -> None:
     else:
         print("  No --reuse_baseline_dir; all methods run fresh.")
 
+    if args.resume:
+        resumed = _load_resume_results(
+            output_dir, len(samples), corpus_chunk_ids, sample_ids,
+            require_top_k=max(recall_k),
+        )
+        for method, results in resumed.items():
+            if method in all_results:
+                print(f"  [resume] {method}: keeping result already loaded")
+                continue
+            all_results[method] = results
+            history_loaded.add(method)
+
     # ── Determine what needs to run ─────────────────────────────────────
     need_bm25 = not args.skip_bm25 and "bm25" not in history_loaded
     need_dense = not args.skip_dense and "dense" not in history_loaded
     need_hybrid = not args.skip_hybrid and "hybrid" not in history_loaded
-    need_colbert = not args.skip_colbert
-    # E5-Mistral: NEVER in history (not in _REUSABLE_METHODS) — always fresh
-    need_e5 = not args.skip_dense  # share --skip_dense flag with Dense
+    need_colbert = not args.skip_colbert and "colbertv2" not in history_loaded
+    need_e5 = not args.skip_dense and "e5_mistral" not in history_loaded
 
     # Index dependencies: Hybrid needs dense_retriever (MiniLM), not e5
     need_dense_index = need_dense or need_hybrid
@@ -824,7 +885,7 @@ def main() -> None:
     print(f"    Dense:      {'RUN' if need_dense else 'SKIP'} (history={'yes' if 'dense' in history_loaded else 'no'})")
     print(f"    Hybrid:     {'RUN' if need_hybrid else 'SKIP'} (history={'yes' if 'hybrid' in history_loaded else 'no'})")
     print(f"    ColBERTv2:  {'RUN' if need_colbert else 'SKIP'}")
-    print(f"    E5-Mistral: {'RUN' if need_e5 else 'SKIP'} (always fresh)")
+    print(f"    E5-Mistral: {'RUN' if need_e5 else 'SKIP'}")
 
     # ── 4. Lazy-build indices ONLY for needed methods ───────────────────
     print("\n[4/5] Building indices (lazy, on-demand) ...")
@@ -886,30 +947,7 @@ def main() -> None:
             need_hybrid = False
 
     if need_colbert:
-        cc = cfg._raw.get("colbert", {})
-        if not cc.get("enabled", True):
-            print("  ColBERTv2: disabled in config"); need_colbert = False
-        elif _COLBERT_IMPORT_ERROR is not None:
-            print(f"  [ERROR] ColBERT: {_COLBERT_IMPORT_ERROR}\n  Use --skip_colbert.")
-            sys.exit(1)
-        elif not _COLBERT_AVAILABLE:
-            print("  [ERROR] colbert-ai not installed. Use --skip_colbert.")
-            sys.exit(1)
-        else:
-            try:
-                colbert = ColBERTv2Retriever(
-                    checkpoint=cc.get("checkpoint", "colbert-ir/colbertv2.0"),
-                    index_root=Path(cc.get("root", "cache/colbert")),
-                    index_name=cc.get("index_name", "finder_colbertv2"),
-                    nbits=cc.get("nbits", 2),
-                    doc_maxlen=cc.get("doc_maxlen", 300),
-                    query_maxlen=cc.get("query_maxlen", 64),
-                    device=args.dense_device,
-                )
-                colbert.index(corpus_chunks, force_rebuild=False, verbose=True)
-                print(f"  ColBERTv2: indexed {len(corpus_chunks)} chunks")
-            except Exception as exc:
-                print(f"  [ERROR] ColBERTv2: {exc}"); sys.exit(1)
+        print("  ColBERTv2: delayed until after E5 checkpoint")
 
     # ── 5. Run retrievers + checkpoint ──────────────────────────────────
     print("\n[5/5] Running retrievers ...")
@@ -957,19 +995,47 @@ def main() -> None:
     else:
         print("\n  [hybrid] SKIPPED")
 
-    # 5d. ColBERTv2
-    if need_colbert and colbert is not None:
-        _do_run("colbertv2", colbert)
-    else:
-        print("\n  [colbertv2] SKIPPED")
-
-    # 5e. E5-Mistral-7B-Instruct (ALWAYS fresh, independent retriever)
+    # 5d. E5-Mistral-7B-Instruct
     if need_e5 and e5_retriever is not None:
         _do_run("e5_mistral", e5_retriever)
     elif need_e5:
         print("\n  [e5_mistral] SKIPPED (no E5 index)")
     else:
         print("\n  [e5_mistral] SKIPPED")
+
+    # 5e. ColBERTv2: build after E5 has been checkpointed, so a ColBERT
+    # failure cannot discard completed E5 work.
+    if need_colbert:
+        cc = cfg._raw.get("colbert", {})
+        if not cc.get("enabled", True):
+            print("\n  [colbertv2] SKIPPED (disabled in config)")
+            need_colbert = False
+        elif _COLBERT_IMPORT_ERROR is not None:
+            print(f"  [ERROR] ColBERT: {_COLBERT_IMPORT_ERROR}\n  Use --skip_colbert.")
+            sys.exit(1)
+        elif not _COLBERT_AVAILABLE:
+            print("  [ERROR] colbert-ai not installed. Use --skip_colbert.")
+            sys.exit(1)
+        else:
+            try:
+                colbert = ColBERTv2Retriever(
+                    checkpoint=cc.get("checkpoint", "colbert-ir/colbertv2.0"),
+                    index_root=Path(cc.get("root", "cache/colbert")),
+                    index_name=cc.get("index_name", "finder_colbertv2"),
+                    nbits=cc.get("nbits", 2),
+                    doc_maxlen=cc.get("doc_maxlen", 300),
+                    query_maxlen=cc.get("query_maxlen", 64),
+                    device=args.dense_device,
+                )
+                colbert.index(corpus_chunks, force_rebuild=False, verbose=True)
+                print(f"  ColBERTv2: indexed {len(corpus_chunks)} chunks")
+                _do_run("colbertv2", colbert)
+            except Exception as exc:
+                print(f"  [ERROR] ColBERTv2: {exc}")
+                print("  Completed earlier methods remain checkpointed in output_dir.")
+                sys.exit(1)
+    else:
+        print("\n  [colbertv2] SKIPPED")
 
     total_t = time.time() - t0
 
