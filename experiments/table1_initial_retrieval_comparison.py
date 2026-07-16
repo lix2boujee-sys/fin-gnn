@@ -8,7 +8,8 @@ Methods (each is an independent full-corpus retriever):
     Dense Retriever         — all-MiniLM-L6-v2 dense retrieval
     Hybrid Retriever        — BM25 + Dense (all-MiniLM-L6-v2), alpha=0.5
     ColBERTv2               — colbert-ir/colbertv2.0 (pretrained, no fine-tuning)
-    E5-Mistral-7B-Instruct   — e5-mistral-7b-instruct (INDEPENDENT dense retriever)
+    BGE-M3-Dense            — BAAI/bge-m3 dense_vecs only
+    SPLADE-v3               — naver/splade-v3 learned sparse retrieval
 
 Metrics: Recall@5, Recall@10, Recall@50, MRR, nDCG@10, Hit@10
 
@@ -35,6 +36,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import pickle
 import sys
 import time
 from datetime import datetime
@@ -51,8 +54,21 @@ from feg_rag.data.corpus import build_benchmark_corpus
 from feg_rag.data.loader import load_dataset
 from feg_rag.evaluation.metrics import compute_all_metrics
 from feg_rag.retrieval.bm25 import BM25Retriever
+from feg_rag.retrieval.bge_m3 import (
+    BGEM3DenseRetriever,
+    RETRIEVER_TYPE as BGE_RETRIEVER_TYPE,
+    build_cache_metadata as bge_build_meta,
+    cache_is_valid as bge_cache_valid,
+)
 from feg_rag.retrieval.dense import DenseRetriever
 from feg_rag.retrieval.hybrid import HybridRetriever
+from feg_rag.retrieval.splade_v3 import (
+    SPLADEV3Retriever,
+    RETRIEVER_TYPE as SPLADE_RETRIEVER_TYPE,
+    build_cache_metadata as splade_build_meta,
+    cache_is_valid as splade_cache_valid,
+)
+from experiments.run_bge_m3_splade_v3 import _load_or_build_index_cache
 
 # ColBERTv2 — lazy; has heavy deps
 _COLBERT_AVAILABLE = False
@@ -68,14 +84,15 @@ except ImportError as exc:
 # Constants
 # ═════════════════════════════════════════════════════════════════════════════
 
-METHOD_ORDER = ["bm25", "dense", "hybrid", "colbertv2", "e5_mistral"]
+METHOD_ORDER = ["bm25", "dense", "hybrid", "colbertv2", "bge_m3_dense", "splade_v3"]
 
 METHOD_LABELS = {
     "bm25": "BM25",
     "dense": "Dense Retriever",
     "hybrid": "Hybrid Retriever",
     "colbertv2": "ColBERTv2",
-    "e5_mistral": "E5-Mistral-7B-Instruct",
+    "bge_m3_dense": "BGE-M3-Dense",
+    "splade_v3": "SPLADE-v3",
 }
 
 METHOD_FILES = {
@@ -83,7 +100,8 @@ METHOD_FILES = {
     "dense": "dense_results.jsonl",
     "hybrid": "hybrid_results.jsonl",
     "colbertv2": "colbertv2_results.jsonl",
-    "e5_mistral": "e5_mistral_results.jsonl",
+    "bge_m3_dense": "bge_m3_dense_results.jsonl",
+    "splade_v3": "splade_v3_results.jsonl",
 }
 
 # ── History reuse ─────────────────────────────────────────────────────────
@@ -109,8 +127,8 @@ KNOWN_GOOD_BASELINES: Dict[str, Dict] = {
 # Per-method provenance
 _PROVENANCE: Dict[str, Dict] = {}
 
-# Methods eligible for history reuse.  E5-Mistral is NOT reusable — always
-# fresh run to avoid contaminating the table with anomalous historical data.
+# Methods eligible for history reuse. Neural replacement baselines are rebuilt
+# or loaded only from validated model/corpus cache, never from old E5 results.
 _REUSABLE_METHODS = {"bm25", "dense", "hybrid"}
 
 _HISTORY_LABEL_MAP = {
@@ -118,9 +136,12 @@ _HISTORY_LABEL_MAP = {
     "dense": "dense", "Dense": "dense", "Dense Retrieval": "dense",
     "hybrid": "hybrid", "Hybrid": "hybrid", "Hybrid (BM25 + Dense)": "hybrid",
     "colbertv2": "colbertv2", "colbert": "colbertv2", "ColBERTv2": "colbertv2",
-    "e5_mistral": "e5_mistral",
-    "e5-mistral-7b-instruct": "e5_mistral",
-    "E5-Mistral-7B-Instruct": "e5_mistral",
+    "bge_m3_dense": "bge_m3_dense",
+    "BGE-M3-Dense": "bge_m3_dense",
+    "BAAI/bge-m3": "bge_m3_dense",
+    "splade_v3": "splade_v3",
+    "SPLADE-v3": "splade_v3",
+    "naver/splade-v3": "splade_v3",
 }
 
 
@@ -144,6 +165,51 @@ def _build_corpus(
     if failed:
         print(f"  [WARN] Gold alignment failed for {len(failed)} evidence snippets")
     return corpus, gold_map
+
+
+def _resolve_cache_path(path: Optional[str], cfg: Config) -> Optional[Path]:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_absolute():
+        p = cfg.root_dir / p
+    return p
+
+
+def _atomic_pickle_dump(data: Dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as fh:
+        pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+
+def _load_or_build_corpus(
+    samples: List[Dict],
+    cfg: Config,
+    cache_path: Optional[Path],
+    *,
+    rebuild: bool,
+    allow_gold_only_corpus: bool,
+) -> Tuple[List[Chunk], Dict[str, List[str]]]:
+    if cache_path and cache_path.exists() and not rebuild:
+        with cache_path.open("rb") as fh:
+            data = pickle.load(fh)
+        print(f"  [corpus-cache] Loaded: {cache_path}")
+        return data["corpus_chunks"], data["gold_map"]
+
+    corpus_chunks, gold_map = _build_corpus(
+        samples,
+        cfg,
+        allow_gold_only_corpus=allow_gold_only_corpus,
+    )
+    if cache_path:
+        _atomic_pickle_dump(
+            {"corpus_chunks": corpus_chunks, "gold_map": gold_map},
+            cache_path,
+        )
+        print(f"  [corpus-cache] Saved: {cache_path}")
+    return corpus_chunks, gold_map
 
 
 def _make_result(sample, retrieved_ids, gold_ids, method) -> Dict:
@@ -572,7 +638,7 @@ def _find_best(summaries):
 
 
 def _write_final(out_dir, all_results, summaries, recall_k, ndcg_k, hit_k,
-                 command="", dense_model="", e5_model=""):
+                 command="", dense_model="", bge_model="", splade_model=""):
     out_dir.mkdir(parents=True, exist_ok=True)
     for method, results in all_results.items():
         _write_method_results(out_dir, method, results)
@@ -597,10 +663,11 @@ def _write_final(out_dir, all_results, summaries, recall_k, ndcg_k, hit_k,
         fh.write("## Run command\n\n```bash\n" + command + "\n```\n\n")
 
         fh.write(
-            "> **Key point:** Dense Retriever and E5-Mistral-7B-Instruct are "
-            "**independent retrievers** using different models.\n"
+            "> **Key point:** BGE-M3-Dense and SPLADE-v3 are standalone "
+            "**replacement baselines** for the anomalous e5 row.\n"
             "> - Dense Retriever → `all-MiniLM-L6-v2`\n"
-            "> - E5-Mistral-7B-Instruct → `e5-mistral-7b-instruct`\n"
+            "> - BGE-M3-Dense → `BAAI/bge-m3` dense_vecs only\n"
+            "> - SPLADE-v3 → `naver/splade-v3` learned sparse vectors\n"
             "> - Hybrid → BM25 + Dense (all-MiniLM-L6-v2), alpha=0.5\n\n"
         )
 
@@ -634,7 +701,8 @@ def _write_final(out_dir, all_results, summaries, recall_k, ndcg_k, hit_k,
             "dense": f"Dense Retriever → `{dense_model}`",
             "hybrid": f"BM25 + Dense (`{dense_model}`), alpha=0.5",
             "colbertv2": "ColBERTv2 → `colbert-ir/colbertv2.0` (pretrained)",
-            "e5_mistral": f"E5-Mistral-7B-Instruct → `{e5_model}`",
+            "bge_m3_dense": f"BGE-M3-Dense → `{bge_model}` dense_vecs only",
+            "splade_v3": f"SPLADE-v3 → `{splade_model}` learned sparse",
         }
         fh.write("| Method | Source | Model |\n")
         fh.write("|---|---|---|\n")
@@ -665,12 +733,14 @@ def _write_final(out_dir, all_results, summaries, recall_k, ndcg_k, hit_k,
         fh.write(f"| Dense Retriever | `{dense_model}` |\n")
         fh.write(f"| Hybrid Retriever | BM25 + Dense (`{dense_model}`), alpha=0.5 |\n")
         fh.write("| ColBERTv2 | `colbert-ir/colbertv2.0` (pretrained, full-corpus) |\n")
-        fh.write(f"| E5-Mistral-7B-Instruct | `{e5_model}` (INDEPENDENT dense retriever) |\n")
+        fh.write(f"| BGE-M3-Dense | `{bge_model}` dense_vecs only |\n")
+        fh.write(f"| SPLADE-v3 | `{splade_model}` learned sparse retriever |\n")
 
-        fh.write("\n## Important: Dense Retriever ≠ E5-Mistral-7B-Instruct\n\n")
+        fh.write("\n## Important: standalone replacement baselines\n\n")
         fh.write("- **Dense Retriever** uses all-MiniLM-L6-v2.\n")
-        fh.write("- **E5-Mistral-7B-Instruct** is a separate retriever with a different model.\n")
-        fh.write("- Hybrid Retriever fuses BM25 + all-MiniLM-L6-v2, NOT BM25 + E5.\n")
+        fh.write("- **BGE-M3-Dense** uses only BGE-M3 dense vectors, not BGE lexical/ColBERT outputs.\n")
+        fh.write("- **SPLADE-v3** is a learned sparse retriever, not BM25.\n")
+        fh.write("- Hybrid Retriever fuses BM25 + all-MiniLM-L6-v2, NOT BM25 + BGE/SPLADE.\n")
         fh.write("- These are independent rows with independent results.\n\n")
 
         fh.write("## Data provenance\n\n")
@@ -700,7 +770,7 @@ def _write_final(out_dir, all_results, summaries, recall_k, ndcg_k, hit_k,
         fh.write("- [x] chunk_ids validated against corpus\n")
         fh.write("- [x] No suspect history reused\n")
         fh.write("- [x] ColBERTv2: full-corpus retrieval, not reranking\n")
-        fh.write("- [x] Dense Retriever and E5-Mistral are truly independent\n")
+        fh.write("- [x] BGE-M3-Dense and SPLADE-v3 are standalone retrievers\n")
 
         fh.write("\n## Output files\n\n")
         for fn in ["table1_initial_retrieval_comparison.csv",
@@ -732,17 +802,29 @@ def main() -> None:
                    help="Dataset split to load, e.g. train/dev/test.")
     p.add_argument("--dense_device", default="cpu")
     p.add_argument("--dense_batch_size", type=int, default=None)
-    p.add_argument("--e5_batch_size", type=int, default=None)
+    p.add_argument("--bge_batch_size", type=int, default=None)
+    p.add_argument("--splade_batch_size", type=int, default=None)
     p.add_argument("--dense_model", default=None, help="Override dense model")
-    p.add_argument("--e5_model", default=None, help="Override E5 model")
+    p.add_argument("--bge_model", default=None, help="Override BGE-M3 model")
+    p.add_argument("--splade_model", default=None, help="Override SPLADE-v3 model")
+    p.add_argument("--hf_endpoint", default=None,
+                   help="HuggingFace endpoint, e.g. https://hf-mirror.com")
     p.add_argument("--skip_bm25", action="store_true")
     p.add_argument("--skip_dense", action="store_true")
     p.add_argument("--skip_hybrid", action="store_true")
     p.add_argument("--skip_colbert", action="store_true")
+    p.add_argument("--skip_bge_m3", action="store_true")
+    p.add_argument("--skip_splade", action="store_true")
+    p.add_argument("--force_rebuild_retriever_cache", action="store_true",
+                   help="Rebuild BGE/SPLADE index caches even if metadata matches.")
     p.add_argument("--reuse_baseline_dir", default=None)
     p.add_argument("--allow_suspect_history", action="store_true", default=False)
     p.add_argument("--allow_na_recall50", action="store_true", default=False)
     p.add_argument("--allow_gold_only_corpus", action="store_true", default=False)
+    p.add_argument("--corpus_cache", default=None,
+                   help="Pickle cache for full benchmark corpus/gold_map")
+    p.add_argument("--rebuild_corpus_cache", action="store_true",
+                   help="Rebuild corpus cache even if it exists")
     p.add_argument("--resume", action="store_true",
                    help="Reuse completed method jsonl files from output_dir.")
     p.add_argument("--overwrite_output_dir", action="store_true")
@@ -762,10 +844,14 @@ def main() -> None:
     # Two independent dense models
     dense_model_name = args.dense_model or cfg.retrieval.get(
         "dense_model", "cache/models/all-MiniLM-L6-v2")
-    e5_model_name = args.e5_model or cfg.retrieval.get(
-        "e5_model", "cache/models/e5-mistral-7b-instruct")
+    bge_model_name = args.bge_model or cfg.retrieval.get(
+        "bge_model", "BAAI/bge-m3")
+    splade_model_name = args.splade_model or cfg.retrieval.get(
+        "splade_model", "naver/splade-v3")
     dense_bs = args.dense_batch_size or cfg.retrieval.get("dense_batch_size")
-    e5_bs = args.e5_batch_size or cfg.retrieval.get("e5_batch_size", dense_bs)
+    bge_bs = args.bge_batch_size or cfg.retrieval.get("bge_batch_size", 16)
+    splade_bs = args.splade_batch_size or cfg.retrieval.get("splade_batch_size", 8)
+    hf_endpoint = args.hf_endpoint or cfg.retrieval.get("hf_endpoint") or os.environ.get("HF_ENDPOINT")
 
     recall_k: List[int] = cfg.evaluation.get("recall_k_values", [5, 10, 50])
     ndcg_k: List[int] = cfg.evaluation.get("ndcg_k_values", [10])
@@ -780,14 +866,18 @@ def main() -> None:
     print("=" * 60)
     print(f"  Output:          {output_dir}")
     print(f"  Dense model:     {dense_model_name}")
-    print(f"  E5 model:        {e5_model_name}")
+    print(f"  BGE-M3 model:    {bge_model_name}")
+    print(f"  SPLADE-v3 model: {splade_model_name}")
     print(f"  Device:          {args.dense_device}")
+    print(f"  HF_ENDPOINT:     {hf_endpoint or 'not set'}")
     print(f"  Top-K:           {top_k_retrieval}")
     print(f"  Eval:            R@{recall_k} nDCG@{ndcg_k} Hit@{hit_k}")
     print(f"  Skip:            bm25={args.skip_bm25} dense={args.skip_dense} "
-          f"hybrid={args.skip_hybrid} colbert={args.skip_colbert}")
+          f"hybrid={args.skip_hybrid} colbert={args.skip_colbert} "
+          f"bge_m3={args.skip_bge_m3} splade={args.skip_splade}")
     print(f"  Reuse:           {args.reuse_baseline_dir or 'none'}")
     print(f"  Resume:          {args.resume}")
+    print(f"  Corpus cache:    {args.corpus_cache or 'disabled'}")
 
     # ── 1. Load data ────────────────────────────────────────────────────
     print("\n[1/5] Loading FinDER data ...")
@@ -806,8 +896,12 @@ def main() -> None:
 
     # ── 2. Build corpus ─────────────────────────────────────────────────
     print("[2/5] Building corpus ...")
-    corpus_chunks, gold_map = _build_corpus(
-        samples, cfg, allow_gold_only_corpus=args.allow_gold_only_corpus
+    corpus_chunks, gold_map = _load_or_build_corpus(
+        samples,
+        cfg,
+        _resolve_cache_path(args.corpus_cache, cfg),
+        rebuild=args.rebuild_corpus_cache,
+        allow_gold_only_corpus=args.allow_gold_only_corpus,
     )
     corpus_chunk_ids = {c.chunk_id for c in corpus_chunks}
     gold_ids = {cid for gids in gold_map.values() for cid in gids}
@@ -873,11 +967,13 @@ def main() -> None:
     need_dense = not args.skip_dense and "dense" not in history_loaded
     need_hybrid = not args.skip_hybrid and "hybrid" not in history_loaded
     need_colbert = not args.skip_colbert and "colbertv2" not in history_loaded
-    need_e5 = not args.skip_dense and "e5_mistral" not in history_loaded
+    need_bge = not args.skip_bge_m3 and "bge_m3_dense" not in history_loaded
+    need_splade = not args.skip_splade and "splade_v3" not in history_loaded
 
-    # Index dependencies: Hybrid needs dense_retriever (MiniLM), not e5
+    # Index dependencies: Hybrid needs dense_retriever (MiniLM), not BGE/SPLADE
     need_dense_index = need_dense or need_hybrid
-    need_e5_index = need_e5
+    need_bge_index = need_bge
+    need_splade_index = need_splade
     need_bm25_index = need_bm25 or need_hybrid
 
     print("\n  Run plan:")
@@ -885,12 +981,13 @@ def main() -> None:
     print(f"    Dense:      {'RUN' if need_dense else 'SKIP'} (history={'yes' if 'dense' in history_loaded else 'no'})")
     print(f"    Hybrid:     {'RUN' if need_hybrid else 'SKIP'} (history={'yes' if 'hybrid' in history_loaded else 'no'})")
     print(f"    ColBERTv2:  {'RUN' if need_colbert else 'SKIP'}")
-    print(f"    E5-Mistral: {'RUN' if need_e5 else 'SKIP'}")
+    print(f"    BGE-M3:     {'RUN' if need_bge else 'SKIP'}")
+    print(f"    SPLADE-v3:  {'RUN' if need_splade else 'SKIP'}")
 
     # ── 4. Lazy-build indices ONLY for needed methods ───────────────────
     print("\n[4/5] Building indices (lazy, on-demand) ...")
 
-    bm25 = dense_retriever = e5_retriever = hybrid = colbert = None
+    bm25 = dense_retriever = bge_retriever = splade_retriever = hybrid = colbert = None
 
     if need_bm25_index:
         bm25 = BM25Retriever(
@@ -919,22 +1016,70 @@ def main() -> None:
     else:
         print(f"  Dense ({dense_model_name}): not needed")
 
-    if need_e5_index:
-        e5_retriever = DenseRetriever(
-            model_name=e5_model_name,
+    if need_bge_index:
+        bge_retriever = BGEM3DenseRetriever(
+            model_name=bge_model_name,
             device=args.dense_device,
-            query_instruction=cfg.retrieval.get("dense_query_instruction"),
-            e5_max_seq_length=cfg.retrieval.get("e5_max_seq_length", 512),
-            e5_batch_size=cfg.retrieval.get("e5_batch_size"),
+            max_length=cfg.retrieval.get("max_length", 512),
+            batch_size=bge_bs,
+            hf_endpoint=hf_endpoint,
+            revision=cfg.retrieval.get("revision", "main"),
+            normalize=True,
             debug=cfg.retrieval.get("debug_dense", False),
         )
-        e5_retriever.index(corpus_chunks, batch_size=e5_bs)
-        dim = e5_retriever.embedding_dim
-        print(f"  E5 ({e5_model_name}): indexed {len(corpus_chunks)} chunks, dim={dim}")
+        bge_retriever, bge_cache_status = _load_or_build_index_cache(
+            retriever_name="BGE-M3-Dense",
+            retriever=bge_retriever,
+            corpus_chunks=corpus_chunks,
+            gold_map=gold_map,
+            cache_dir=cfg.cache_dir / "retrieval_indexes" / BGE_RETRIEVER_TYPE,
+            build_meta=bge_build_meta,
+            cache_valid=bge_cache_valid,
+            load_fn=BGEM3DenseRetriever.load,
+            chunk_size=cfg.chunk_size,
+            chunk_overlap=cfg.chunk_overlap,
+            force_rebuild=args.force_rebuild_retriever_cache,
+            verbose=True,
+        )
+        dim = bge_retriever.embedding_dim
+        print(f"  BGE-M3-Dense ({bge_model_name}): ready, dim={dim}, cache={bge_cache_status}")
         if dim is None or dim == 0:
-            print("  [ERROR] E5 embeddings empty!"); sys.exit(1)
+            print("  [ERROR] BGE-M3 embeddings empty!"); sys.exit(1)
     else:
-        print(f"  E5 ({e5_model_name}): not needed")
+        print(f"  BGE-M3-Dense ({bge_model_name}): not needed")
+
+    if need_splade_index:
+        splade_retriever = SPLADEV3Retriever(
+            model_name=splade_model_name,
+            device=args.dense_device,
+            max_length=cfg.retrieval.get("max_length", 512),
+            batch_size=splade_bs,
+            hf_endpoint=hf_endpoint,
+            revision=cfg.retrieval.get("revision", "main"),
+            sparsify_threshold=cfg.retrieval.get("splade_sparsify_threshold", 0.0),
+            normalize=False,
+            debug=cfg.retrieval.get("debug_dense", False),
+        )
+        splade_retriever, splade_cache_status = _load_or_build_index_cache(
+            retriever_name="SPLADE-v3",
+            retriever=splade_retriever,
+            corpus_chunks=corpus_chunks,
+            gold_map=gold_map,
+            cache_dir=cfg.cache_dir / "retrieval_indexes" / SPLADE_RETRIEVER_TYPE,
+            build_meta=splade_build_meta,
+            cache_valid=splade_cache_valid,
+            load_fn=SPLADEV3Retriever.load,
+            chunk_size=cfg.chunk_size,
+            chunk_overlap=cfg.chunk_overlap,
+            force_rebuild=args.force_rebuild_retriever_cache,
+            verbose=True,
+        )
+        dim = splade_retriever.embedding_dim
+        print(f"  SPLADE-v3 ({splade_model_name}): ready, dim={dim}, cache={splade_cache_status}")
+        if dim is None or dim == 0:
+            print("  [ERROR] SPLADE-v3 sparse dimension empty!"); sys.exit(1)
+    else:
+        print(f"  SPLADE-v3 ({splade_model_name}): not needed")
 
     if need_hybrid:
         if bm25 is not None and dense_retriever is not None:
@@ -947,7 +1092,7 @@ def main() -> None:
             need_hybrid = False
 
     if need_colbert:
-        print("  ColBERTv2: delayed until after E5 checkpoint")
+        print("  ColBERTv2: delayed until after BGE/SPLADE checkpoint")
 
     # ── 5. Run retrievers + checkpoint ──────────────────────────────────
     print("\n[5/5] Running retrievers ...")
@@ -995,16 +1140,24 @@ def main() -> None:
     else:
         print("\n  [hybrid] SKIPPED")
 
-    # 5d. E5-Mistral-7B-Instruct
-    if need_e5 and e5_retriever is not None:
-        _do_run("e5_mistral", e5_retriever)
-    elif need_e5:
-        print("\n  [e5_mistral] SKIPPED (no E5 index)")
+    # 5d. BGE-M3-Dense
+    if need_bge and bge_retriever is not None:
+        _do_run("bge_m3_dense", bge_retriever)
+    elif need_bge:
+        print("\n  [bge_m3_dense] SKIPPED (no BGE-M3 index)")
     else:
-        print("\n  [e5_mistral] SKIPPED")
+        print("\n  [bge_m3_dense] SKIPPED")
 
-    # 5e. ColBERTv2: build after E5 has been checkpointed, so a ColBERT
-    # failure cannot discard completed E5 work.
+    # 5e. SPLADE-v3
+    if need_splade and splade_retriever is not None:
+        _do_run("splade_v3", splade_retriever)
+    elif need_splade:
+        print("\n  [splade_v3] SKIPPED (no SPLADE-v3 index)")
+    else:
+        print("\n  [splade_v3] SKIPPED")
+
+    # 5f. ColBERTv2: build after replacement baselines have been checkpointed,
+    # so a ColBERT failure cannot discard completed neural baseline work.
     if need_colbert:
         cc = cfg._raw.get("colbert", {})
         if not cc.get("enabled", True):
@@ -1080,7 +1233,9 @@ def main() -> None:
     _write_final(
         output_dir, all_results, summaries, recall_k, ndcg_k, hit_k,
         command=" ".join(sys.argv),
-        dense_model=dense_model_name, e5_model=e5_model_name,
+        dense_model=dense_model_name,
+        bge_model=bge_model_name,
+        splade_model=splade_model_name,
     )
 
     print(f"\nOutput: {output_dir}")

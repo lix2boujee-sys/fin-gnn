@@ -11,7 +11,7 @@ import pickle
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -21,6 +21,11 @@ from torch.utils.data import DataLoader, Dataset
 
 from feg_rag.data.chunker import Chunk
 from feg_rag.graph.builder import FinancialEvidenceGraph
+from feg_rag.rerank.query_features import (
+    QUERY_FEATURE_DIM,
+    build_query_augmented_features,
+)
+from feg_rag.rerank.scoring import normalise_score_map
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -31,6 +36,16 @@ class RGCNLayer(nn.Module):
     """Single R-GCN layer: one weight matrix per relation type.
 
     h_i^(l+1) = σ( W_0^(l) h_i^(l) + Σ_r Σ_j∈N_i^r (1/c_i,r) W_r^(l) h_j^(l) )
+
+    Notes:
+        * The adjacency matrices in ``adj_list`` are expected to be
+          **pre-normalised** (e.g. D^-0.5 A D^-0.5) by the caller.
+        * ``norm_list`` is accepted for API compatibility but is **not used**
+          internally — normalisation is folded into the adjacency.
+        * Self-loop is handled by ``self_loop`` (a dedicated ``nn.Linear``),
+          not by an identity relation in ``adj_list``.  This keeps the
+          implementation stable regardless of how relation adjacencies are
+          constructed.
     """
 
     def __init__(
@@ -61,15 +76,19 @@ class RGCNLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        adj_list: List[torch.Tensor],  # [num_relations * (N, N)] — sparse or dense
-        norm_list: List[torch.Tensor],  # [num_relations * (N,)]
+        adj_list: List[torch.Tensor],  # [num_relations * (N, N)] — pre-normalised
+        norm_list: List[torch.Tensor],  # [num_relations * (N,)] — accepted but NOT used
     ) -> torch.Tensor:
         """Forward pass.
 
         Args:
             x: Node features (N, in_dim).
-            adj_list: List of adjacency matrices, one per relation type, each (N, N).
+            adj_list: List of **pre-normalised** adjacency matrices, one per
+                relation type, each (N, N).
             norm_list: Per-node normalisation scalars per relation.
+                **Accepted for API compatibility but not used** —
+                normalisation is assumed to be folded into adj_list by the
+                dataset / rerank methods.
 
         Returns:
             Updated node features (N, out_dim).
@@ -120,12 +139,14 @@ class RGCNReranker(nn.Module):
 
         Args:
             x: Node features (N, in_dim).
-            adj_list: List of adjacency matrices per relation type.
+            adj_list: List of **pre-normalised** adjacency matrices per
+                relation type.
 
         Returns:
             Per-node scores (N, 1).
         """
-        # Use identity norm_list (normalisation folded into adj_list)
+        # Use identity norm_list (normalisation folded into adj_list by caller).
+        # See RGCNLayer.forward docstring for rationale.
         norm_list = [torch.ones(a.shape[0], device=x.device) if a.numel() > 0
                      else torch.tensor([], device=x.device) for a in adj_list]
 
@@ -147,10 +168,12 @@ class RGCNRerankDataset(Dataset):
         graph: FinancialEvidenceGraph,
         features: Dict[str, np.ndarray],
         relation_map: Optional[Dict[str, int]] = None,
+        chunk_lookup: Optional[Dict[str, Chunk]] = None,
     ):
         self.samples = samples
         self.graph = graph
         self.features = features
+        self._chunk_lookup = chunk_lookup or _build_rgcn_chunk_lookup(graph)
 
         # Build relation → integer index mapping
         if relation_map is None:
@@ -182,12 +205,26 @@ class RGCNRerankDataset(Dataset):
         node2idx = {n: i for i, n in enumerate(node_list)}
         N = len(node_list)
 
-        # Feature matrix
-        feat_dim = next(iter(self.features.values())).shape[0]
-        x = np.zeros((N, feat_dim), dtype=np.float32)
+        # Base feature matrix
+        base_dim = next(iter(self.features.values())).shape[0]
+        x_base = np.zeros((N, base_dim), dtype=np.float32)
         for n in node_list:
             if n in self.features:
-                x[node2idx[n]] = self.features[n]
+                x_base[node2idx[n]] = self.features[n]
+
+        # Query-aware augmented features (same logic as GraphSAGE)
+        question = s.get("question", "")
+        ret_scores = s.get("retrieval_scores", None) or {}
+        graph_scores = s.get("graph_scores", None) or {}
+        x_aug = build_query_augmented_features(
+            self.features, node_list, question,
+            chunk_lookup=self._chunk_lookup,
+            retrieval_scores=ret_scores,
+            graph_scores=graph_scores,
+        )
+
+        # Concatenate base + query features
+        x = np.concatenate([x_base, x_aug], axis=1)
 
         # Per-relation adjacency matrices
         adj_list = [
@@ -195,11 +232,17 @@ class RGCNRerankDataset(Dataset):
             for _ in range(self.num_relations)
         ]
         for u, v, k, etype in self.graph.graph.edges(keys=True, data="edge_type"):
-            if u in node2idx and v in node2idx:
-                r = self.relation_map.get(etype, 0)
-                i, j = node2idx[u], node2idx[v]
-                adj_list[r][i, j] = 1.0
-                adj_list[r][j, i] = 1.0  # symmetrize
+            if u not in node2idx or v not in node2idx:
+                continue
+            r = self.relation_map.get(etype)
+            # Unknown relation types (not in relation_map) are skipped to
+            # avoid silently polluting relation 0.  They do not contribute
+            # to any relation adjacency.
+            if r is None:
+                continue
+            i, j = node2idx[u], node2idx[v]
+            adj_list[r][i, j] = 1.0
+            adj_list[r][j, i] = 1.0  # symmetrize
 
         # Normalise each relation adjacency (D^-0.5 A D^-0.5)
         for r in range(self.num_relations):
@@ -226,7 +269,11 @@ class RGCNRerankDataset(Dataset):
 class RGCNFusionReranker:
     """R-GCN reranker with score fusion.
 
-    final_score = α * retrieval_score + β * graph_score + γ * gnn_score
+    final_score = α * retrieval_norm + β * graph_norm + γ * gnn_norm
+
+    Each score component is min-max normalised within the current query's
+    candidate set before fusion.  alpha/beta/gamma are linear fusion weights
+    and are NOT required to sum to 1.
     """
 
     def __init__(
@@ -355,6 +402,9 @@ class RGCNFusionReranker:
     ) -> List[Tuple[Chunk, float]]:
         """Rerank candidate chunks with R-GCN + fusion scoring.
 
+        All three score components are min-max normalised within the candidate
+        set before fusion, preventing raw-logit dominance.
+
         Args:
             query: The question text.
             candidate_chunks: List of (Chunk, retrieval_score).
@@ -376,12 +426,30 @@ class RGCNFusionReranker:
         node2idx = {n: i for i, n in enumerate(node_list)}
         N = len(node_list)
 
-        # Feature matrix
-        feat_dim = next(iter(features.values())).shape[0]
-        x = np.zeros((N, feat_dim), dtype=np.float32)
+        # Build chunk_lookup
+        chunk_lookup = _build_rgcn_chunk_lookup(graph)
+        for chunk, _ in candidate_chunks:
+            chunk_lookup[chunk.chunk_id] = chunk
+
+        retrieval_scores = {c.chunk_id: s for c, s in candidate_chunks}
+
+        # Base feature matrix
+        base_dim = next(iter(features.values())).shape[0]
+        x_base = np.zeros((N, base_dim), dtype=np.float32)
         for n in node_list:
             if n in features:
-                x[node2idx[n]] = features[n]
+                x_base[node2idx[n]] = features[n]
+
+        # Query-aware augmented features (same logic as training)
+        x_aug = build_query_augmented_features(
+            features, node_list, query,
+            chunk_lookup=chunk_lookup,
+            retrieval_scores=retrieval_scores,
+            graph_scores=ppr_scores or {},
+        )
+
+        # Concatenate base + query features
+        x = np.concatenate([x_base, x_aug], axis=1)
 
         # Per-relation adjacency
         adj_list_np = [
@@ -389,11 +457,16 @@ class RGCNFusionReranker:
             for _ in range(self.num_relations)
         ]
         for u, v, k, etype in graph.graph.edges(keys=True, data="edge_type"):
-            if u in node2idx and v in node2idx:
-                r = self.relation_map.get(etype, 0)
-                i, j = node2idx[u], node2idx[v]
-                adj_list_np[r][i, j] = 1.0
-                adj_list_np[r][j, i] = 1.0
+            if u not in node2idx or v not in node2idx:
+                continue
+            r = self.relation_map.get(etype)
+            # Unknown relation types are skipped — they do NOT silently map to
+            # relation 0, preserving the integrity of known relations.
+            if r is None:
+                continue
+            i, j = node2idx[u], node2idx[v]
+            adj_list_np[r][i, j] = 1.0
+            adj_list_np[r][j, i] = 1.0
 
         for r in range(self.num_relations):
             a = adj_list_np[r]
@@ -404,20 +477,29 @@ class RGCNFusionReranker:
         with torch.no_grad():
             x_t = torch.from_numpy(x).to(self.device)
             adj_list_t = [torch.from_numpy(a).to(self.device) for a in adj_list_np]
-            gnn_scores = self.model(x_t, adj_list_t).squeeze(-1).cpu().numpy()
+            gnn_logits = self.model(x_t, adj_list_t).squeeze(-1).cpu().numpy()
 
-        # Fuse scores
+        # Build per-candidate score maps
+        ret_map = {c.chunk_id: s for c, s in candidate_chunks}
+        graph_map = ppr_scores or {}
+        gnn_map = {
+            node_list[i]: float(gnn_logits[i])
+            for i in range(N) if node_list[i] in ret_map
+        }
+
+        # Normalise each score component within candidates
+        ret_norm = normalise_score_map(ret_map)
+        graph_norm = normalise_score_map(graph_map)
+        gnn_norm = normalise_score_map(gnn_map)
+
+        # Fusion with normalised scores
         reranked: List[Tuple[Chunk, float]] = []
-        for chunk, ret_score in candidate_chunks:
+        for chunk, _ in candidate_chunks:
             cid = chunk.chunk_id
-            gnn_s = float(gnn_scores[node2idx[cid]]) if cid in node2idx else 0.0
-            graph_s = ppr_scores.get(cid, 0.0) if ppr_scores else 0.0
-
-            final = (
-                self.alpha * ret_score
-                + self.beta * graph_s
-                + self.gamma * gnn_s
-            )
+            rn = ret_norm.get(cid, 0.0)
+            gn = graph_norm.get(cid, 0.0)
+            gnn_n = gnn_norm.get(cid, 0.0)
+            final = self.alpha * rn + self.beta * gn + self.gamma * gnn_n
             reranked.append((chunk, final))
 
         reranked.sort(key=lambda x: x[1], reverse=True)
@@ -497,3 +579,29 @@ def _collate_rgcn(batch):
     ])
 
     return x_big, adj_big, pos_global, neg_global
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Internal helper
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_rgcn_chunk_lookup(
+    graph: FinancialEvidenceGraph,
+) -> Dict[str, Chunk]:
+    """Build a minimal ``chunk_id → Chunk`` dict from graph node attributes."""
+    lookup: Dict[str, Chunk] = {}
+    for node_id in graph.graph.nodes():
+        if graph.node_types.get(node_id) != "chunk":
+            continue
+        attrs = graph.graph.nodes[node_id]
+        lookup[node_id] = Chunk(
+            chunk_id=node_id,
+            text=attrs.get("text", ""),
+            chunk_type="text",
+            doc_id=attrs.get("doc_id", ""),
+            company=attrs.get("company", ""),
+            filing_type=attrs.get("filing_type", ""),
+            filing_year=str(attrs.get("filing_year", "")),
+            section=attrs.get("section", ""),
+        )
+    return lookup

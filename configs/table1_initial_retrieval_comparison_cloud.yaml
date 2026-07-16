@@ -6,7 +6,8 @@
 #   - Dense Retriever (all-MiniLM-L6-v2)
 #   - Hybrid Retriever (BM25 + all-MiniLM-L6-v2, alpha=0.5)
 #   - ColBERTv2 (colbert-ir/colbertv2.0, pretrained, no fine-tuning)
-#   - E5-Mistral-7B-Instruct (INDEPENDENT retriever, NOT a clone of Dense)
+#   - BGE-M3-Dense (BAAI/bge-m3 dense_vecs only)
+#   - SPLADE-v3 (naver/splade-v3 learned sparse retriever)
 #
 # Usage:
 #   # Full experiment with history reuse
@@ -50,13 +51,19 @@ retrieval:
   bm25_b: 0.75
   # Dense Retriever model — used for the "Dense Retriever" row and Hybrid fusion.
   dense_model: "cache/models/all-MiniLM-L6-v2"
-  # E5-Mistral-7B-Instruct model — used ONLY for the "E5-Mistral-7B-Instruct" row.
-  e5_model: "cache/models/e5-mistral-7b-instruct"
-  # Query instruction for E5-Mistral query encoding
+  # Replacement standalone baselines for the old anomalous e5 row.
+  bge_model: "BAAI/bge-m3"
+  splade_model: "naver/splade-v3"
+  hf_endpoint: "https://hf-mirror.com"
+  max_length: 512
+  bge_batch_size: 16
+  splade_batch_size: 8
+  splade_sparsify_threshold: 0.0
+  revision: "main"
+  # Legacy DenseRetriever/E5-style settings used by Dense Retriever internals.
   dense_query_instruction: "Given a financial question, retrieve relevant evidence passages from SEC filings that directly support the answer."
   e5_max_seq_length: 512
   dense_batch_size: 4
-  e5_batch_size: 4
   debug_dense: false
   hybrid_alpha: 0.5
 

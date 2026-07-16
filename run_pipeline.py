@@ -188,6 +188,9 @@ class Pipeline:
             hybrid_results = hybrid.search(question, top_k=top_k_retrieval)
             candidate_ids = [c.chunk_id for c, _ in hybrid_results]
 
+            # Construct retrieval_scores for PPR fusion
+            retrieval_scores = {c.chunk_id: float(score) for c, score in hybrid_results}
+
             q_metrics = extractor.extract_metrics(question)
             q_years = extractor.extract_years(question)
 
@@ -199,6 +202,8 @@ class Pipeline:
                 seed_metric_names=list(q_metrics),
                 seed_year_values=list(q_years),
                 alpha=self.cfg.rerank["ppr_alpha"],
+                retrieval_scores=retrieval_scores,
+                retrieval_weight=self.cfg.rerank.get("ppr_retrieval_weight", 0.5),
             )
             ppr_sorted = sorted(ppr_scores, key=lambda x: x[1], reverse=True)
 

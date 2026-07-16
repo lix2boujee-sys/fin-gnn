@@ -18,6 +18,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from feg_rag.data.chunker import Chunk
 from feg_rag.graph.builder import FinancialEvidenceGraph
+from feg_rag.rerank.query_features import (
+    QUERY_FEATURE_DIM,
+    build_query_augmented_features,
+)
+from feg_rag.rerank.scoring import normalise_score_map
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -86,10 +91,12 @@ class RerankDataset(Dataset):
         samples: List[Dict],
         graph: FinancialEvidenceGraph,
         features: Dict[str, np.ndarray],
+        chunk_lookup: Optional[Dict[str, Chunk]] = None,
     ):
         self.samples = samples
         self.graph = graph
         self.features = features
+        self._chunk_lookup = chunk_lookup or _build_chunk_lookup_from_graph(graph)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -104,18 +111,42 @@ class RerankDataset(Dataset):
         # Safety cap for any remaining edge cases
         max_sub_nodes = 2000
         if len(sub_nodes) > max_sub_nodes:
-            sub_nodes = [s["positive"], s["negative"]] + sub_nodes[:max_sub_nodes - 2]
+            priority = [s["positive"], s["negative"]]
+            seen = set()
+            capped = []
+            for n in priority + sub_nodes:
+                if n in seen:
+                    continue
+                seen.add(n)
+                capped.append(n)
+                if len(capped) >= max_sub_nodes:
+                    break
+            sub_nodes = capped
         node2idx = {n: i for i, n in enumerate(sub_nodes)}
         N = len(sub_nodes)
 
-        # Feature matrix
-        feat_dim = next(iter(self.features.values())).shape[0]
-        x = np.zeros((N, feat_dim), dtype=np.float32)
+        # Base feature matrix
+        base_dim = next(iter(self.features.values())).shape[0]
+        x_base = np.zeros((N, base_dim), dtype=np.float32)
         for n in sub_nodes:
             if n in self.features:
-                x[node2idx[n]] = self.features[n]
+                x_base[node2idx[n]] = self.features[n]
 
-        # Adjacency (undirected, self-loops)
+        # Query-aware augmented features (training/inference use same logic)
+        question = s.get("question", "")
+        ret_scores = s.get("retrieval_scores", None) or {}
+        graph_scores = s.get("graph_scores", None) or {}
+        x_aug = build_query_augmented_features(
+            self.features, sub_nodes, question,
+            chunk_lookup=self._chunk_lookup,
+            retrieval_scores=ret_scores,
+            graph_scores=graph_scores,
+        )
+
+        # Concatenate base + query features
+        x = np.concatenate([x_base, x_aug], axis=1)
+
+        # Adjacency (undirected, with explicit self-loops)
         adj = np.zeros((N, N), dtype=np.float32)
         for n in sub_nodes:
             for _, neighbor in self.graph.graph.edges(n):
@@ -123,7 +154,11 @@ class RerankDataset(Dataset):
                     i, j = node2idx[n], node2idx[neighbor]
                     adj[i, j] = 1.0
                     adj[j, i] = 1.0
-        # Normalise (D^-0.5 A D^-0.5)
+
+        # Explicit self-loop: preserve chunk's own features during message passing
+        np.fill_diagonal(adj, 1.0)
+
+        # Normalise (D^-0.5 A D^-0.5) — self-loop ensures diagonal > 0
         deg = adj.sum(axis=1) + 1e-8
         d_inv_sqrt = np.diag(1.0 / np.sqrt(deg))
         adj_norm = d_inv_sqrt @ adj @ d_inv_sqrt
@@ -146,7 +181,11 @@ class RerankDataset(Dataset):
 class GNNFusionReranker:
     """GNN reranker with score fusion.
 
-    final_score = α * retrieval_score + β * graph_score + γ * gnn_score
+    final_score = α * retrieval_norm + β * graph_norm + γ * gnn_norm
+
+    Each score component is min-max normalised within the current query's
+    candidate set before fusion.  alpha/beta/gamma are linear fusion weights
+    and are NOT required to sum to 1.
     """
 
     def __init__(
@@ -272,6 +311,9 @@ class GNNFusionReranker:
     ) -> List[Tuple[Chunk, float]]:
         """Rerank candidate chunks using fusion of retrieval + graph + GNN scores.
 
+        All three score components are min-max normalised within the candidate
+        set before fusion, preventing raw-logit dominance.
+
         Args:
             query: The question text.
             candidate_chunks: List of (Chunk, retrieval_score) from initial retrieval.
@@ -294,14 +336,34 @@ class GNNFusionReranker:
         node2idx = {n: i for i, n in enumerate(node_list)}
         N = len(node_list)
 
-        # Feature matrix
-        feat_dim = next(iter(features.values())).shape[0]
-        x = np.zeros((N, feat_dim), dtype=np.float32)
+        # Build chunk_lookup from candidate_chunks + graph nodes
+        chunk_lookup = _build_chunk_lookup_from_graph(graph)
+        # Override with actual Chunk objects from candidates
+        for chunk, _ in candidate_chunks:
+            chunk_lookup[chunk.chunk_id] = chunk
+
+        # Retrieval scores from candidate_chunks
+        retrieval_scores = {c.chunk_id: s for c, s in candidate_chunks}
+
+        # Base feature matrix
+        base_dim = next(iter(features.values())).shape[0]
+        x_base = np.zeros((N, base_dim), dtype=np.float32)
         for n in node_list:
             if n in features:
-                x[node2idx[n]] = features[n]
+                x_base[node2idx[n]] = features[n]
 
-        # Adjacency
+        # Query-aware augmented features (same logic as training)
+        x_aug = build_query_augmented_features(
+            features, node_list, query,
+            chunk_lookup=chunk_lookup,
+            retrieval_scores=retrieval_scores,
+            graph_scores=ppr_scores or {},
+        )
+
+        # Concatenate base + query features
+        x = np.concatenate([x_base, x_aug], axis=1)
+
+        # Adjacency (undirected, with explicit self-loops — same as training)
         adj = np.zeros((N, N), dtype=np.float32)
         for n in node_list:
             for _, neighbor in graph.graph.edges(n):
@@ -309,6 +371,7 @@ class GNNFusionReranker:
                     i, j = node2idx[n], node2idx[neighbor]
                     adj[i, j] = 1.0
                     adj[j, i] = 1.0
+        np.fill_diagonal(adj, 1.0)
         deg = adj.sum(axis=1) + 1e-8
         d_inv_sqrt = np.diag(1.0 / np.sqrt(deg))
         adj_norm = d_inv_sqrt @ adj @ d_inv_sqrt
@@ -316,22 +379,29 @@ class GNNFusionReranker:
         with torch.no_grad():
             x_t = torch.from_numpy(x).to(self.device)
             adj_t = torch.from_numpy(adj_norm).to(self.device)
-            gnn_scores = self.model(x_t, adj_t).squeeze(-1).cpu().numpy()
+            gnn_logits = self.model(x_t, adj_t).squeeze(-1).cpu().numpy()
 
-        # Fuse scores
-        retrieval_map = {c.chunk_id: s for c, s in candidate_chunks}
+        # Build per-candidate score maps
+        ret_map = {c.chunk_id: s for c, s in candidate_chunks}
+        graph_map = ppr_scores or {}
+        gnn_map = {
+            node_list[i]: float(gnn_logits[i])
+            for i in range(N) if node_list[i] in ret_map
+        }
+
+        # Normalise each score component within candidates
+        ret_norm = normalise_score_map(ret_map)
+        graph_norm = normalise_score_map(graph_map)
+        gnn_norm = normalise_score_map(gnn_map)
+
+        # Fusion with normalised scores (alpha/beta/gamma are linear weights)
         reranked: List[Tuple[Chunk, float]] = []
-        for chunk, ret_score in candidate_chunks:
+        for chunk, _ in candidate_chunks:
             cid = chunk.chunk_id
-            gnn_s = float(gnn_scores[node2idx[cid]]) if cid in node2idx else 0.0
-            graph_s = ppr_scores.get(cid, 0.0) if ppr_scores else 0.0
-
-            # Min-max normalise each to [0,1] (done per-query; approximate here)
-            final = (
-                self.alpha * ret_score
-                + self.beta * graph_s
-                + self.gamma * gnn_s
-            )
+            rn = ret_norm.get(cid, 0.0)
+            gn = graph_norm.get(cid, 0.0)
+            gnn_n = gnn_norm.get(cid, 0.0)
+            final = self.alpha * rn + self.beta * gn + self.gamma * gnn_n
             reranked.append((chunk, final))
 
         reranked.sort(key=lambda x: x[1], reverse=True)
@@ -400,3 +470,34 @@ def _collate_gnn(batch):
     ])
 
     return x_big, adj_big, pos_global, neg_global
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Internal helper: build minimal chunk lookup from graph node attributes
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_chunk_lookup_from_graph(
+    graph: FinancialEvidenceGraph,
+) -> Dict[str, Chunk]:
+    """Build a minimal ``chunk_id → Chunk`` dict from graph node attributes.
+
+    Used as a fallback when the caller does not provide a full chunk list.
+    Node attributes for non-chunk types may be incomplete; query feature
+    matching degrades gracefully in that case.
+    """
+    lookup: Dict[str, Chunk] = {}
+    for node_id in graph.graph.nodes():
+        if graph.node_types.get(node_id) != "chunk":
+            continue
+        attrs = graph.graph.nodes[node_id]
+        lookup[node_id] = Chunk(
+            chunk_id=node_id,
+            text=attrs.get("text", ""),
+            chunk_type="text",
+            doc_id=attrs.get("doc_id", ""),
+            company=attrs.get("company", ""),
+            filing_type=attrs.get("filing_type", ""),
+            filing_year=str(attrs.get("filing_year", "")),
+            section=attrs.get("section", ""),
+        )
+    return lookup

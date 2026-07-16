@@ -11,6 +11,8 @@ huggingface_hub>=0.20
 rank-bm25>=0.2
 sentence-transformers>=2.7
 faiss-cpu>=1.8
+FlagEmbedding>=1.2.10
+scipy>=1.10
 
 # Graph
 networkx>=3.2

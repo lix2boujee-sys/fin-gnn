@@ -1,60 +1,20 @@
-# Python / environment
+# Python / 环境
 .venv/
 conda-env/
 .tmp/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-pytest-cache-files-*
-pytest-tmp/
-tests/_tmp/
-tests/_runtime/
 
-# Cache & outputs
+# 缓存与输出
 cache/
 outputs/
-fin-gnn_outputs/
-wandb/
-runs/
-logs/
 
-# Data (large files)
-FinDER/
-10-k/
-*.parquet
-*.zip
-*.7z
-*.tar
-*.tar.gz
-
-# Model weights / indexes / checkpoints
-*.safetensors
-*.bin
-*.pt
-*.pth
-*.onnx
-*.faiss
-*.npy
-*.npz
-
-# Paper drafts and local scratch files
-*.pdf
-tmp_*
-
-# API keys & secrets
-.env
-*.env
-*_api_key*
-*_secret*
+# 数据（体积大，按需保留）
+# FinDER/
+# 10-k/
 
 # IDE
 .claude/
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
+__pycache__/
+*.pyc
+tests/_runtime/
+tests/_colbert_runtime/
+.pytest_tmp_colbert_manifest/

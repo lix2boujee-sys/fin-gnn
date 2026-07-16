@@ -100,6 +100,7 @@ DEFAULTS: Dict[str, Any] = {
     "rerank": {
         "ppr_alpha": 0.85,
         "ppr_max_iter": 100,
+        "ppr_retrieval_weight": 0.5,  # weight for retrieval scores in PPR fusion
         "gnn_model": "sage",  # sage | rgcn
         "gnn_hidden": 128,
         "gnn_layers": 2,
