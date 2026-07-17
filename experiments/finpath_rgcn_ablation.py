@@ -29,6 +29,8 @@ from feg_rag.rerank.path_encoder import (
     FinancialPathExtractor,
     PATH_FEATURE_KEYS,
     build_path_vocab,
+    canonical_metric,
+    expand_years_from_text,
     compute_path_features,
 )
 
@@ -67,7 +69,44 @@ def load_graph_cache(path: str | Path):
     return data
 
 
-def sample_query_entities(question: str, sample: Dict[str, Any]) -> Dict[str, Any]:
+def _edge_type(data: Any) -> str:
+    return str(data.get("edge_type", "")) if isinstance(data, dict) else ""
+
+
+def _candidate_company_hint(graph: Any, candidate_ids: Sequence[str], top_k: int = 20) -> List[str]:
+    """Infer weak company hints from top candidates' filing links."""
+
+    nxg = graph.graph if hasattr(graph, "graph") else graph
+    counts: Dict[str, int] = defaultdict(int)
+    for cid in candidate_ids[:top_k]:
+        if cid not in nxg:
+            continue
+        attrs = nxg.nodes.get(cid, {})
+        if attrs.get("company"):
+            counts[str(attrs["company"]).strip()] += 1
+        for _, filing, data in nxg.out_edges(cid, data=True):
+            if _edge_type(data) != "chunk-belongs-to-filing":
+                continue
+            fattrs = nxg.nodes.get(filing, {})
+            company = fattrs.get("company")
+            if not company:
+                raw = str(filing).split("::", 1)[-1]
+                company = raw.split("_", 1)[0]
+            if company:
+                counts[str(company).strip()] += 1
+    if not counts:
+        return []
+    best_count = max(counts.values())
+    threshold = max(2, int(0.25 * min(len(candidate_ids), top_k)))
+    return [c for c, n in counts.items() if n == best_count and n >= threshold]
+
+
+def sample_query_entities(
+    question: str,
+    sample: Dict[str, Any],
+    graph: Any | None = None,
+    candidate_ids: Sequence[str] | None = None,
+) -> Dict[str, Any]:
     extractor = EntityExtractor()
     fake_chunk = type("QuestionChunk", (), {"chunk_id": "query", "text": question, "section": "", "filing_type": ""})()
     ents = extractor.extract(fake_chunk)
@@ -75,12 +114,17 @@ def sample_query_entities(question: str, sample: Dict[str, Any]) -> Dict[str, An
     companies = set(ents.companies)
     if md.get("company"):
         companies.add(str(md["company"]))
+    if graph is not None and candidate_ids:
+        companies.update(_candidate_company_hint(graph, candidate_ids))
+    metrics = {canonical_metric(m) for m in ents.metrics}
+    years = set(ents.years) | expand_years_from_text(question)
     return {
         "company": list(companies),
-        "years": list(ents.years),
-        "metrics": list(ents.metrics),
+        "years": list(years),
+        "metrics": list(metrics),
         "filing_type": list(ents.filing_types),
         "section_hint": list(ents.sections),
+        "query_text": question,
     }
 
 
@@ -88,6 +132,7 @@ def build_items(
     bge_rows: Sequence[Dict[str, Any]],
     rgcn_by_qid: Dict[str, Dict[str, Any]],
     top_n: int,
+    graph: Any | None = None,
     num_samples: int | None = None,
 ) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
@@ -107,7 +152,7 @@ def build_items(
             "retrieval_scores": bge_scores,
             "rgcn_scores": rgcn_scores,
         }
-        item["query_entities"] = sample_query_entities(item["query"], item)
+        item["query_entities"] = sample_query_entities(item["query"], item, graph=graph, candidate_ids=bge_ids)
         items.append(item)
     return items
 
@@ -224,8 +269,9 @@ def run_ablation(args: argparse.Namespace) -> None:
     bge_rows = load_jsonl(args.candidate_results_jsonl)
     rgcn_by_qid = load_results_by_qid(args.rgcn_results_jsonl)
     graph = load_graph_cache(args.graph_cache)
-    items = build_items(bge_rows, rgcn_by_qid, args.top_n, args.num_samples)
-    train_items, eval_items = split_train_eval(items, args.train_ratio, args.seed)
+    items = build_items(bge_rows, rgcn_by_qid, args.top_n, graph=graph, num_samples=args.num_samples)
+    train_items, heldout_items = split_train_eval(items, args.train_ratio, args.seed)
+    eval_items = items if args.eval_scope == "all" else heldout_items
 
     extractor = FinancialPathExtractor(args.max_paths_per_chunk, args.max_path_len)
     all_paths = {}
@@ -259,6 +305,9 @@ def run_ablation(args: argparse.Namespace) -> None:
             beta_company=args.beta_company,
             anchor_lambda=args.anchor_lambda,
             correction_l2_lambda=args.correction_l2_lambda,
+            path_rank_weighting=not args.disable_path_rank_weighting,
+            min_pair_path_signal=args.min_pair_path_signal,
+            rank_loss_base_weight=args.rank_loss_base_weight,
             use_hard_negative_loss=args.use_hard_negative_loss,
             seed=args.seed,
         )
@@ -372,6 +421,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_n", type=int, default=50)
     parser.add_argument("--num_samples", type=int, default=None)
     parser.add_argument("--train_ratio", type=float, default=0.8)
+    parser.add_argument("--eval_scope", choices=["all", "heldout"], default="all")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", default="cuda")
@@ -390,6 +440,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta_company", type=float, default=0.5)
     parser.add_argument("--anchor_lambda", type=float, default=1.0)
     parser.add_argument("--correction_l2_lambda", type=float, default=0.1)
+    parser.add_argument("--disable_path_rank_weighting", action="store_true")
+    parser.add_argument("--min_pair_path_signal", type=float, default=0.05)
+    parser.add_argument("--rank_loss_base_weight", type=float, default=0.0)
     parser.add_argument("--use_hard_negative_loss", action="store_true", default=True)
     parser.add_argument("--debug_examples", type=int, default=10)
     return parser.parse_args()

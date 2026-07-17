@@ -7,6 +7,7 @@ small neural components for encoding and aggregating typed financial paths.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -44,6 +45,39 @@ PATH_FEATURE_KEYS = [
     "year_conflict_exists",
     "metric_conflict_exists",
 ]
+
+METRIC_ALIASES = {
+    "revenue": {
+        "revenue", "revenues", "sales", "net sales", "net revenue", "total revenue",
+        "data and access solutions rev", "rev",
+    },
+    "income": {
+        "net income", "net earnings", "net loss", "earnings", "profit", "profits",
+    },
+    "operating_income": {
+        "operating income", "operating earnings", "operating loss",
+    },
+    "gross_profit": {"gross profit", "gross margin"},
+    "eps": {"eps", "earnings per share", "diluted eps", "basic eps"},
+    "ebitda": {"ebitda", "adjusted ebitda", "ebit"},
+    "cash_flow": {
+        "cash flow", "operating cash flow", "free cash flow", "cash and cash equivalents",
+    },
+    "assets": {"total assets", "assets"},
+    "liabilities": {"total liabilities", "liabilities"},
+    "equity": {"total equity", "shareholders equity", "stockholders equity", "equity"},
+    "debt": {"long-term debt", "short-term debt", "debt"},
+    "expenses": {
+        "operating expenses", "r&d expenses", "research and development",
+        "sg&a", "selling general and administrative", "cost of revenue", "cogs",
+    },
+}
+
+_METRIC_ALIAS_LOOKUP = {
+    alias: canonical
+    for canonical, aliases in METRIC_ALIASES.items()
+    for alias in aliases
+}
 
 
 @dataclass
@@ -115,6 +149,44 @@ def _norm_set(value: Any) -> set[str]:
         return {_norm_text(v) for v in value if _norm_text(v)}
     text = _norm_text(value)
     return {text} if text else set()
+
+
+def canonical_metric(value: Any) -> str:
+    text = _norm_text(value).replace("_", " ")
+    text = re.sub(r"\s+", " ", text)
+    if text in _METRIC_ALIAS_LOOKUP:
+        return _METRIC_ALIAS_LOOKUP[text]
+    for alias, canonical in _METRIC_ALIAS_LOOKUP.items():
+        if alias and alias in text:
+            return canonical
+    return text
+
+
+def canonical_metric_set(values: Iterable[Any]) -> set[str]:
+    return {canonical_metric(v) for v in values if canonical_metric(v)}
+
+
+def _metric_aliases_in_text(text: str) -> set[str]:
+    norm = _norm_text(text).replace("_", " ")
+    found: set[str] = set()
+    for alias in _METRIC_ALIAS_LOOKUP:
+        if re.search(rf"\b{re.escape(alias)}\b", norm):
+            found.add(alias)
+    return found
+
+
+def expand_years_from_text(text: str) -> set[str]:
+    """Extract standalone years and compact ranges like 2021-23."""
+
+    text = str(text or "")
+    years = {m.group(0) for m in re.finditer(r"\b(?:19|20)\d{2}\b", text)}
+    for m in re.finditer(r"\b((?:19|20)\d{2})\s*(?:-|to|through|–|—)\s*(\d{2}|(?:19|20)\d{2})\b", text, re.I):
+        start = int(m.group(1))
+        end_raw = m.group(2)
+        end = int(end_raw) if len(end_raw) == 4 else int(str(start)[:2] + end_raw)
+        if start <= end and end - start <= 10:
+            years.update(str(y) for y in range(start, end + 1))
+    return years
 
 
 def _entity_value(node_id: str) -> str:
@@ -193,7 +265,10 @@ class FinancialPathExtractor:
     def _normalise_query_entities(query_entities: Dict[str, Any]) -> Dict[str, set[str]]:
         companies = _norm_set(query_entities.get("company")) | _norm_set(query_entities.get("companies"))
         years = _norm_set(query_entities.get("year")) | _norm_set(query_entities.get("years"))
-        metrics = _norm_set(query_entities.get("metric")) | _norm_set(query_entities.get("metrics"))
+        years |= expand_years_from_text(str(query_entities.get("query_text", "")))
+        metrics_raw = _norm_set(query_entities.get("metric")) | _norm_set(query_entities.get("metrics"))
+        metrics_raw |= _metric_aliases_in_text(str(query_entities.get("query_text", "")))
+        metrics = canonical_metric_set(metrics_raw)
         filings = _norm_set(query_entities.get("filing_type")) | _norm_set(query_entities.get("filing_types"))
         sections = _norm_set(query_entities.get("section_hint")) | _norm_set(query_entities.get("sections"))
         return {
@@ -354,7 +429,8 @@ class FinancialPathExtractor:
             if _node_type(graph, node) != key:
                 continue
             value = _entity_value(node)
-            if value not in entities[key]:
+            comparable_value = canonical_metric(value) if key == "metric" else value
+            if comparable_value not in entities[key]:
                 continue
             paths.append(
                 self._make_path(
@@ -412,7 +488,7 @@ class FinancialPathExtractor:
                     )
         if entities["metric"]:
             for node, _ in _out_edges_of_type(nxg, cid, "chunk-mentions-metric"):
-                if _node_type(graph, node) == "metric" and _entity_value(node) not in entities["metric"]:
+                if _node_type(graph, node) == "metric" and canonical_metric(_entity_value(node)) not in entities["metric"]:
                     paths.append(
                         self._make_path(
                             graph,
@@ -453,7 +529,7 @@ class FinancialPathExtractor:
                 flags["year_match"] = int(flags["year_match"] or _entity_value(node) in entities["year"])
         if entities["metric"]:
             for node, _ in _out_edges_of_type(nxg, cid, "chunk-mentions-metric"):
-                flags["metric_match"] = int(flags["metric_match"] or _entity_value(node) in entities["metric"])
+                flags["metric_match"] = int(flags["metric_match"] or canonical_metric(_entity_value(node)) in entities["metric"])
         attrs = nxg.nodes.get(cid, {})
         if entities["company"]:
             flags["company_match"] = int(_norm_text(attrs.get("company")) in entities["company"])

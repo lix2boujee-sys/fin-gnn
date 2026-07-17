@@ -413,6 +413,31 @@ def rule_based_path_score(
     return float(rgcn_score + tau * np.tanh(support - conflict))
 
 
+def path_evidence_signal(paths: Sequence[FinancialPath], max_paths: int = 8) -> float:
+    """Signed confidence that paths support a candidate.
+
+    Positive means typed paths support the candidate; negative means conflict
+    paths dominate.  The value is intentionally simple and bounded so it can be
+    used as a training gate without becoming another opaque model.
+    """
+
+    f = compute_path_features(paths, max_paths=max_paths)
+    features = dict(zip(PATH_FEATURE_KEYS, f))
+    support = (
+        0.30 * features["path_coverage_ratio"]
+        + 0.20 * features["company_path_exists"]
+        + 0.20 * features["year_path_exists"]
+        + 0.20 * features["metric_path_exists"]
+        + 0.10 * features["semantic_support_path_exists"]
+    )
+    conflict = (
+        0.35 * features["company_conflict_exists"]
+        + 0.35 * features["year_conflict_exists"]
+        + 0.30 * features["metric_conflict_exists"]
+    )
+    return float(np.clip(support - conflict, -1.0, 1.0))
+
+
 def train_finpath_pairwise(
     model: FinPathRGCNReranker,
     train_queries: Sequence[Dict[str, Any]],
@@ -426,6 +451,9 @@ def train_finpath_pairwise(
     beta_company: float = 0.5,
     anchor_lambda: float = 1.0,
     correction_l2_lambda: float = 0.1,
+    path_rank_weighting: bool = True,
+    min_pair_path_signal: float = 0.05,
+    rank_loss_base_weight: float = 0.0,
     use_hard_negative_loss: bool = True,
     seed: int = 42,
     verbose: bool = True,
@@ -449,6 +477,8 @@ def train_finpath_pairwise(
     for epoch in range(epochs):
         total = 0.0
         count = 0
+        active_pairs = 0
+        skipped_pairs = 0
         for item in train_queries:
             cids = list(item.get("candidate_chunk_ids", []))
             gold = set(item.get("gold_evidence_ids", []))
@@ -461,6 +491,7 @@ def train_finpath_pairwise(
 
             paths_map = extractor.extract_paths(graph, cids, item.get("query_entities", {}))
             paths = [paths_map.get(cid, []) for cid in cids]
+            path_signals = [path_evidence_signal(p, model.max_paths_per_chunk) for p in paths]
             ret_t = _as_tensor(item.get("retrieval_scores", [0.0] * len(cids)), device)
             rgcn_t = _as_tensor(item.get("rgcn_scores", [0.0] * len(cids)), device)
             q_emb = query_entities_to_embedding(item.get("query_entities", {}), model.hidden_dim, device)
@@ -471,12 +502,19 @@ def train_finpath_pairwise(
                 neg_choices = neg_idx[:10]
                 for ni in neg_choices:
                     weight = 1.0
+                    if path_rank_weighting:
+                        pair_signal = path_signals[pi] - path_signals[ni]
+                        if pair_signal < min_pair_path_signal:
+                            skipped_pairs += 1
+                            continue
+                        weight = rank_loss_base_weight + pair_signal
                     if use_hard_negative_loss:
                         feats = dict(zip(PATH_FEATURE_KEYS, compute_path_features(paths[ni], model.max_paths_per_chunk)))
                         weight += beta_year * feats["year_conflict_exists"]
                         weight += beta_metric * feats["metric_conflict_exists"]
                         weight += beta_company * feats["company_conflict_exists"]
                     losses.append(weight * F.relu(margin - scores[pi] + scores[ni]))
+                    active_pairs += 1
             if not losses:
                 continue
             rank_loss = torch.stack(losses).mean()
@@ -494,5 +532,8 @@ def train_finpath_pairwise(
         avg = total / max(count, 1)
         history.append(avg)
         if verbose:
-            print(f"  Epoch {epoch + 1:>3}/{epochs}  finpath_loss={avg:.6f}")
+            print(
+                f"  Epoch {epoch + 1:>3}/{epochs}  finpath_loss={avg:.6f}  "
+                f"active_pairs={active_pairs} skipped_pairs={skipped_pairs}"
+            )
     return history
