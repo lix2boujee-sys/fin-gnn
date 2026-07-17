@@ -242,6 +242,7 @@ def run_ablation(args: argparse.Namespace) -> None:
         tau=args.tau,
         max_paths_per_chunk=args.max_paths_per_chunk,
         max_path_len=args.max_path_len,
+        path_gate_floor=args.path_gate_floor,
         device=device,
     )
     if args.epochs > 0:
@@ -256,6 +257,8 @@ def run_ablation(args: argparse.Namespace) -> None:
             beta_year=args.beta_year,
             beta_metric=args.beta_metric,
             beta_company=args.beta_company,
+            anchor_lambda=args.anchor_lambda,
+            correction_l2_lambda=args.correction_l2_lambda,
             use_hard_negative_loss=args.use_hard_negative_loss,
             seed=args.seed,
         )
@@ -379,11 +382,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["residual", "concat_mlp"], default="residual")
-    parser.add_argument("--tau", type=float, default=0.2)
+    parser.add_argument("--tau", type=float, default=0.05)
+    parser.add_argument("--path_gate_floor", type=float, default=0.0)
     parser.add_argument("--margin", type=float, default=0.1)
     parser.add_argument("--beta_year", type=float, default=0.5)
     parser.add_argument("--beta_metric", type=float, default=0.5)
     parser.add_argument("--beta_company", type=float, default=0.5)
+    parser.add_argument("--anchor_lambda", type=float, default=1.0)
+    parser.add_argument("--correction_l2_lambda", type=float, default=0.1)
     parser.add_argument("--use_hard_negative_loss", action="store_true", default=True)
     parser.add_argument("--debug_examples", type=int, default=10)
     return parser.parse_args()

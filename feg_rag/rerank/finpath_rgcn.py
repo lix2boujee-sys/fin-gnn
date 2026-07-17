@@ -123,6 +123,7 @@ class FinPathRGCNReranker(nn.Module):
         max_paths_per_chunk: int = 8,
         max_path_len: int = 4,
         device: str = "cpu",
+        path_gate_floor: float = 0.0,
     ):
         super().__init__()
         if fusion_mode not in {"residual", "concat_mlp"}:
@@ -134,6 +135,7 @@ class FinPathRGCNReranker(nn.Module):
         self.rgcn_embedding_dim = int(rgcn_embedding_dim)
         self.max_paths_per_chunk = max_paths_per_chunk
         self.max_path_len = max_path_len
+        self.path_gate_floor = float(path_gate_floor)
         self.device_name = device
 
         self.path_encoder = LearnablePathEncoder(
@@ -236,7 +238,15 @@ class FinPathRGCNReranker(nn.Module):
             corr_in = torch.cat(parts).float()
 
             if self.fusion_mode == "residual":
-                correction = self.tau * torch.tanh(self.correction_mlp(corr_in).squeeze(-1))
+                # Only let the path branch move the R-GCN score when there is
+                # actual path evidence.  This prevents the no-path embedding or
+                # retrieval score from becoming a free global reranker.
+                path_gate = torch.clamp(
+                    path_feats[0] + path_feats[1] + path_feats[2],
+                    min=self.path_gate_floor,
+                    max=1.0,
+                )
+                correction = self.tau * path_gate * torch.tanh(self.correction_mlp(corr_in).squeeze(-1))
                 final = rgcn_scores[i] + correction
             else:
                 final = self.concat_mlp(torch.cat([rgcn_scores[i].view(1), corr_in])).squeeze(-1)
@@ -336,6 +346,7 @@ class FinPathRGCNReranker(nn.Module):
                 "rgcn_embedding_dim": self.rgcn_embedding_dim,
                 "max_paths_per_chunk": self.max_paths_per_chunk,
                 "max_path_len": self.max_path_len,
+                "path_gate_floor": self.path_gate_floor,
             },
             path,
         )
@@ -351,6 +362,7 @@ class FinPathRGCNReranker(nn.Module):
             rgcn_embedding_dim=int(ckpt.get("rgcn_embedding_dim", 0)),
             max_paths_per_chunk=int(ckpt.get("max_paths_per_chunk", 8)),
             max_path_len=int(ckpt.get("max_path_len", 4)),
+            path_gate_floor=float(ckpt.get("path_gate_floor", 0.0)),
             device=device,
         )
         model.load_state_dict(ckpt["model_state"])
@@ -412,6 +424,8 @@ def train_finpath_pairwise(
     beta_year: float = 0.5,
     beta_metric: float = 0.5,
     beta_company: float = 0.5,
+    anchor_lambda: float = 1.0,
+    correction_l2_lambda: float = 0.1,
     use_hard_negative_loss: bool = True,
     seed: int = 42,
     verbose: bool = True,
@@ -465,7 +479,13 @@ def train_finpath_pairwise(
                     losses.append(weight * F.relu(margin - scores[pi] + scores[ni]))
             if not losses:
                 continue
-            loss = torch.stack(losses).mean()
+            rank_loss = torch.stack(losses).mean()
+            # Keep the model score-preserving: the path branch should be a
+            # small explanation-aware correction, not a replacement reranker.
+            correction = scores - rgcn_t
+            anchor_loss = torch.mean(correction.pow(2))
+            correction_l2 = torch.mean(torch.abs(correction))
+            loss = rank_loss + anchor_lambda * anchor_loss + correction_l2_lambda * correction_l2
             opt.zero_grad()
             loss.backward()
             opt.step()
