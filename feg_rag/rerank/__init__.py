@@ -1,8 +1,10 @@
-"""Evidence reranking: PPR, GNN, R-GCN, QFE-RGCN, MonoT5, ListT5, and constraint-aware fusion."""
+"""Evidence reranking: PPR, GNN, R-GCN, QFE-RGCN, FinPath-RGCN, MonoT5, ListT5, and constraint-aware fusion."""
 
 from feg_rag.rerank.ppr import ppr_rerank
 from feg_rag.rerank.gnn import GraphSAGEReranker, GNNFusionReranker, RerankDataset
 from feg_rag.rerank.rgcn import RGCNReranker, RGCNFusionReranker, RGCNRerankDataset
+from feg_rag.rerank.path_encoder import FinancialPath, FinancialPathExtractor
+from feg_rag.rerank.finpath_rgcn import FinPathRGCNReranker
 from feg_rag.rerank.qfe_rgcn import (
     QFERGCNLayer,
     QFERGCNReranker,

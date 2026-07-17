@@ -121,6 +121,23 @@ DEFAULTS: Dict[str, Any] = {
         "metric_match_weight": 0.8,
         "filing_type_match_weight": 0.5,
     },
+    # ---- FinPath-RGCN path-aware reranker ----
+    "finpath_rgcn": {
+        "enabled": True,
+        "max_paths_per_chunk": 8,
+        "max_path_len": 4,
+        "hidden_dim": 128,
+        "dropout": 0.1,
+        "path_encoder": "gru",
+        "fusion_mode": "residual",
+        "tau": 0.2,
+        "margin": 0.1,
+        "beta_year": 0.5,
+        "beta_metric": 0.5,
+        "beta_company": 0.5,
+        "use_hard_negative_loss": True,
+        "debug_examples": 10,
+    },
     # ---- generation ----
     "generation": {
         "model": "gpt-4o",
