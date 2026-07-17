@@ -12,6 +12,7 @@ Methods compared:
     + R-GCN
     + R-GCN + Constraint Score
     Final Graph (Ours) — QFE-RGCN
+    Fast Final Graph (Ours) — Lightweight Query-Adaptive Fusion
 
 Metrics: Recall@5, Recall@10, MRR, nDCG@10
 
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import pickle
 import random
@@ -43,6 +45,7 @@ from typing import Dict, List, Optional, Set, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
+import torch.nn as nn
 
 from feg_rag.config import Config
 from feg_rag.data.chunker import Chunk
@@ -57,12 +60,16 @@ from feg_rag.rerank.gnn import GNNFusionReranker, GraphSAGEReranker
 from feg_rag.rerank.ppr import ppr_rerank
 from feg_rag.rerank.qfe_rgcn import (
     QFERGCNFusionReranker,
+    QFERGCNFusionRerankerV2,
     QFERGCNReranker,
     QFERGCNRerankDataset,
     EntityGatedScoringHead,
+    RetrievalPreservedFusionHead,
     QUERY_EMBED_DIM,
+    BGE_QUERY_EMBED_DIM,
     derive_query_vector,
     build_query_embedding_cache,
+    build_bge_query_embedding_cache,
 )
 from feg_rag.rerank.query_features import QUERY_FEATURE_DIM
 from feg_rag.rerank.rgcn import RGCNFusionReranker, RGCNReranker
@@ -74,6 +81,20 @@ from feg_rag.rerank.train import (
 )
 from feg_rag.rerank.mono_t5 import run_mono_t5_reranking
 from feg_rag.rerank.list_t5 import run_list_t5_reranking
+from feg_rag.rerank.fast_final_graph import (
+    FastFinalGraphDataset,
+    QueryAdaptiveFusionReranker,
+    load_jsonl_results,
+    save_checkpoint,
+    load_checkpoint,
+    train_fast_final_graph,
+    evaluate_fast_final_graph,
+    compute_config_fingerprint,
+    save_dataset_cache,
+    load_dataset_cache,
+    PAIR_FEATURE_DIM,
+    QUERY_ONLY_FEATURE_DIM,
+)
 from feg_rag.retrieval.bm25 import BM25Retriever
 from feg_rag.retrieval.cross_encoder import CrossEncoderReranker
 from feg_rag.retrieval.dense import DenseRetriever
@@ -410,15 +431,17 @@ METHOD_FILES = {
     "rgcn": "rgcn_results.jsonl",
     "rgcn_constraint": "rgcn_constraint_results.jsonl",
     "qfe_rgcn": "qfe_rgcn_results.jsonl",
+    "qfe_rgcn_v2": "qfe_rgcn_v2_results.jsonl",
     "qfe_rgcn_ppr": "qfe_rgcn_ppr_results.jsonl",
     "mono_t5": "mono_t5_results.jsonl",
     "list_t5": "list_t5_results.jsonl",
+    "fast_final_graph": "fast_final_graph_results.jsonl",
 }
 
 METHOD_ORDER = [
     "best_retriever", "cross_encoder", "ppr",
-    "graphsage", "rgcn", "rgcn_constraint", "qfe_rgcn", "qfe_rgcn_ppr",
-    "mono_t5", "list_t5",
+    "graphsage", "rgcn", "rgcn_constraint", "qfe_rgcn", "qfe_rgcn_v2", "qfe_rgcn_ppr",
+    "mono_t5", "list_t5", "fast_final_graph",
 ]
 
 METHOD_LABELS = {
@@ -428,10 +451,12 @@ METHOD_LABELS = {
     "graphsage": "+ GraphSAGE",
     "rgcn": "+ R-GCN",
     "rgcn_constraint": "+ R-GCN + Constraint Score",
-    "qfe_rgcn": "Final Graph (Ours)",
-    "qfe_rgcn_ppr": "Final Graph (Ours) + PPR",
+    "qfe_rgcn": "Final Graph v1 (Ours)",
+    "qfe_rgcn_v2": "Final Graph v2 (Ours)",
+    "qfe_rgcn_ppr": "Final Graph v1 (Ours) + PPR",
     "mono_t5": "MonoT5",
     "list_t5": "ListT5",
+    "fast_final_graph": "Fast Final Graph (Ours)",
 }
 
 
@@ -667,6 +692,11 @@ def run_qfe_rgcn(
     *,
     use_ppr: bool = False,
     allow_fallback: bool = False,
+    progress_every: int = 100,
+    partial_output_dir: Optional[Path] = None,
+    resume_rerank: bool = False,
+    score_cache_path: Optional[Path] = None,
+    checkpoint_path: Optional[str] = None,
 ) -> List[Dict]:
     """QFE-RGCN reranking with entity-gated evidence scoring.
 
@@ -681,17 +711,111 @@ def run_qfe_rgcn(
         allow_fallback: If True, fall back to candidate_ids[:output_k] when
             rerank raises an exception (with explicit logging).  Default
             False — fail fast so bugs are not silently hidden.
+        progress_every: Print progress and write partial results every N
+            newly-processed queries (0 to disable).
+        partial_output_dir: If set, write partial JSONL and flush score cache
+            at each progress checkpoint.
+        resume_rerank: Skip queries already present in the partial JSONL.
+        score_cache_path: Directory for persistent rerank-score cache.
+        checkpoint_path: Path to the loaded checkpoint (used as part of the
+            score-cache key to detect model changes).
     """
-    results = []
-    for s in samples:
+    results: List[Dict] = []
+    completed_ids: Set[str] = set()
+
+    # -- resolve partial path -------------------------------------------------
+    partial_path: Optional[Path] = None
+    if partial_output_dir is not None:
+        partial_output_dir = Path(partial_output_dir)
+        fname = METHOD_FILES.get(method_name, f"{method_name}_results.jsonl")
+        partial_path = partial_output_dir / f"{fname}.partial"
+
+    # -- resume from partial --------------------------------------------------
+    if resume_rerank and partial_path is not None and partial_path.exists():
+        with open(partial_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    results.append(r)
+                    completed_ids.add(r["question_id"])
+                except json.JSONDecodeError:
+                    continue
+        if results:
+            print(
+                f"    [{method_name}] Resumed {len(results)} completed queries "
+                f"from {partial_path}"
+            )
+
+    # -- score cache ----------------------------------------------------------
+    score_cache: Dict[str, Dict] = {}
+    checkpoint_hash = ""
+    qfe_config_hash = ""
+    use_ppr_flag = use_ppr or method_name == "qfe_rgcn_ppr"
+
+    if score_cache_path is not None:
+        score_cache_dir = Path(score_cache_path)
+        score_cache = _load_qfe_score_cache(score_cache_dir, method_name)
+        if checkpoint_path is not None:
+            checkpoint_hash = _compute_file_hash(Path(checkpoint_path))
+        # Infer config hash from the loaded reranker
+        gnn_hidden = int(qfe_reranker.model.conv1.self_loop.out_features)
+        gnn_out_dim = int(qfe_reranker.model.out_dim)
+        base_feat_dim = int(qfe_reranker.scoring_head.chunk_proj[0].in_features)
+        qfe_config_hash = _compute_qfe_config_hash(
+            query_embed_dim=qfe_reranker.query_embed_dim,
+            relation_map=qfe_reranker.relation_map,
+            gnn_hidden=gnn_hidden,
+            gnn_out_dim=gnn_out_dim,
+            base_feat_dim=base_feat_dim,
+        )
+        if score_cache:
+            print(
+                f"    [{method_name}] Loaded {len(score_cache)} cached scores "
+                f"from {score_cache_dir}"
+            )
+
+    # -- main loop ------------------------------------------------------------
+    t_start = time.time()
+    new_count = 0
+    cache_hits = 0
+    cache_dirty = False
+
+    for idx, s in enumerate(samples, 1):
+        if s["id"] in completed_ids:
+            continue
+
         hr = hybrid.search(s["question"], top_k=top_n)
         chunks = [c for c, _ in hr]
         candidate_ids = [c.chunk_id for c in chunks]
 
-        # PPR is an independent baseline — only compute if explicitly requested
-        # for ablation studies (--qfe_use_ppr).
+        # --- score cache lookup ----------------------------------------------
+        cache_key: Optional[str] = None
+        if score_cache_path is not None and checkpoint_hash:
+            cache_key = _compute_qfe_score_cache_key(
+                question_id=s["id"],
+                candidate_ids=candidate_ids,
+                checkpoint_hash=checkpoint_hash,
+                method_name=method_name,
+                use_ppr=use_ppr_flag,
+                top_n=top_n,
+                output_k=output_k,
+                config_hash=qfe_config_hash,
+            )
+            if cache_key in score_cache:
+                cached_entry = score_cache[cache_key]
+                cached_ids = list(cached_entry.get("reranked_ids", []))[:output_k]
+                results.append(
+                    _make_result(s, cached_ids, gold_map.get(s["id"], []), method_name)
+                )
+                cache_hits += 1
+                continue
+
+        # --- PPR (only if explicitly requested) ------------------------------
         ppr_scores: Dict[str, float] = {}
-        if use_ppr:
+        if use_ppr_flag:
             q_metrics = extractor.extract_metrics(s["question"])
             q_years = extractor.extract_years(s["question"])
             ppr_scores = dict(ppr_rerank(
@@ -703,12 +827,13 @@ def run_qfe_rgcn(
                 retrieval_scores={c.chunk_id: float(score) for c, score in hr},
             ))
 
-        # Ensure query embedding is available
+        # --- query embedding -------------------------------------------------
         if s["question"] not in qfe_reranker.query_embeddings:
             qfe_reranker.query_embeddings[s["question"]] = derive_query_vector(
                 s["question"], dim=qfe_reranker.query_embed_dim,
             )
 
+        # --- rerank ----------------------------------------------------------
         if allow_fallback:
             try:
                 reranked = qfe_reranker.rerank(
@@ -716,14 +841,19 @@ def run_qfe_rgcn(
                     ppr_scores=ppr_scores,
                 )
                 ids = [c.chunk_id for c, _ in reranked[:output_k]]
+                scores = [float(score) for _, score in reranked[:output_k]]
             except Exception as exc:
-                print(f"    [qfe_rgcn FALLBACK] query_id={s['id']} "
-                      f"exception={type(exc).__name__}: {exc}")
+                print(
+                    f"    [{method_name} FALLBACK] query_id={s['id']} "
+                    f"exception={type(exc).__name__}: {exc}"
+                )
                 ids = candidate_ids[:output_k]
+                scores = [0.0] * len(ids)
                 r = _make_result(s, ids, gold_map.get(s["id"], []), method_name)
                 r["_fallback"] = True
                 r["_fallback_exception"] = f"{type(exc).__name__}: {exc}"
                 results.append(r)
+                new_count += 1
                 continue
         else:
             reranked = qfe_reranker.rerank(
@@ -731,8 +861,65 @@ def run_qfe_rgcn(
                 ppr_scores=ppr_scores,
             )
             ids = [c.chunk_id for c, _ in reranked[:output_k]]
+            scores = [float(score) for _, score in reranked[:output_k]]
 
-        results.append(_make_result(s, ids, gold_map.get(s["id"], []), method_name))
+        results.append(
+            _make_result(s, ids, gold_map.get(s["id"], []), method_name)
+        )
+        new_count += 1
+
+        # --- persist to score cache ------------------------------------------
+        if cache_key is not None and score_cache_path is not None:
+            score_cache[cache_key] = {
+                "cache_key": cache_key,
+                "question_id": s["id"],
+                "reranked_ids": ids,
+                "reranked_scores": scores,
+            }
+            cache_dirty = True
+
+        # --- progress logging ------------------------------------------------
+        total_done = len(results)
+        if progress_every > 0 and (
+            new_count % progress_every == 0
+            or total_done == len(samples)
+        ):
+            elapsed = time.time() - t_start
+            rate = new_count / max(elapsed, 1e-6)
+            remaining = len(samples) - total_done
+            eta = remaining / max(rate, 1e-6)
+            pct = total_done / max(len(samples), 1) * 100
+            print(
+                f"    [{method_name}] eval {total_done}/{len(samples)} "
+                f"({pct:.1f}%) elapsed={elapsed:.1f}s eta={eta:.1f}s",
+                flush=True,
+            )
+
+        # --- partial checkpoint ----------------------------------------------
+        if (
+            partial_path is not None
+            and progress_every > 0
+            and new_count % progress_every == 0
+        ):
+            _write_jsonl(partial_path, results)
+            if cache_dirty and score_cache_path is not None:
+                _save_qfe_score_cache(
+                    Path(score_cache_path), method_name, score_cache
+                )
+                cache_dirty = False
+
+    # -- final flush ----------------------------------------------------------
+    total_elapsed = time.time() - t_start
+    if partial_path is not None:
+        _write_jsonl(partial_path, results)
+    if cache_dirty and score_cache_path is not None:
+        _save_qfe_score_cache(Path(score_cache_path), method_name, score_cache)
+
+    print(
+        f"    [{method_name}] Evaluation done in {total_elapsed:.1f}s "
+        f"(cache hits: {cache_hits}, computed: {new_count})"
+    )
+
     return results
 
 
@@ -870,6 +1057,261 @@ def run_list_t5(
             partial_path.unlink(missing_ok=True)
 
     return results
+
+
+def run_fast_final_graph_method(
+    train_samples: List[Dict],
+    eval_samples: List[Dict],
+    gold_map: Dict[str, List[str]],
+    chunk_by_id: Dict[str, Chunk],
+    bge_results_jsonl: str | Path,
+    rgcn_results_jsonl: str | Path,
+    monot5_results_jsonl: str | Path,
+    output_dir: Path,
+    *,
+    ppr_results_jsonl: Optional[str | Path] = None,
+    model_cache_path: Optional[str | Path] = None,
+    epochs: int = 20,
+    batch_size: int = 512,
+    lr: float = 1e-3,
+    min_rgcn_weight: float = 0.35,
+    min_bge_weight: float = 0.15,
+    max_entity_weight: float = 0.10,
+    delta_scale: float = 0.05,
+    hard_negatives: int = 10,
+    top_n: int = 50,
+    output_k: int = 10,
+    device: str = "cpu",
+    val_split: float = 0.2,
+    split_seed: int = 42,
+    load_checkpoint_path: Optional[str] = None,
+    progress_every: int = 100,
+    eval_only: bool = False,
+) -> Tuple[List[Dict], Optional[QueryAdaptiveFusionReranker], Dict]:
+    """Train (or load) and evaluate the Fast Final Graph fusion reranker.
+
+    Returns
+    -------
+    results : list[dict]
+        Standard per-query result dicts.
+    model : QueryAdaptiveFusionReranker or None
+    meta : dict
+        Training metadata including learned weights.
+    """
+    import random
+
+    t_total = time.time()
+    meta: Dict = {
+        "method": "fast_final_graph",
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "min_rgcn_weight": min_rgcn_weight,
+        "min_bge_weight": min_bge_weight,
+        "max_entity_weight": max_entity_weight,
+        "delta_scale": delta_scale,
+        "hard_negatives": hard_negatives,
+    }
+
+    # ---- 1. Load external results ----
+    print(f"\n  [fast_final_graph] Loading external results...")
+    bge_results = load_jsonl_results(bge_results_jsonl)
+    rgcn_results = load_jsonl_results(rgcn_results_jsonl)
+    monot5_results = load_jsonl_results(monot5_results_jsonl)
+    print(f"    BGE queries: {len(bge_results)}")
+    print(f"    R-GCN queries: {len(rgcn_results)}")
+    print(f"    MonoT5 queries: {len(monot5_results)}")
+
+    # ---- 1b. Optionally load PPR ----
+    ppr_results: Optional[Dict[str, Dict]] = None
+    if ppr_results_jsonl:
+        ppr_results = load_jsonl_results(ppr_results_jsonl)
+        print(f"    [fast_final_graph] PPR/graph source: loaded {len(ppr_results)} queries")
+    else:
+        print(f"    [fast_final_graph] PPR/graph source: disabled")
+
+    # ---- 2. Build model ----
+    model = QueryAdaptiveFusionReranker(
+        min_rgcn_weight=min_rgcn_weight,
+        min_bge_weight=min_bge_weight,
+        max_entity_weight=max_entity_weight,
+        delta_scale=delta_scale,
+        use_delta_mlp=True,
+        dropout=0.1,
+    )
+
+    if load_checkpoint_path:
+        # eval-only path
+        print(f"\n  [fast_final_graph] Loading checkpoint: {load_checkpoint_path}")
+        model, ckpt_meta = load_checkpoint(load_checkpoint_path, device=device)
+        meta["checkpoint_loaded"] = str(load_checkpoint_path)
+        meta.update({f"ckpt_{k}": v for k, v in ckpt_meta.items() if isinstance(v, (int, float, str, bool))})
+        print(f"    Loaded in {time.time() - t_total:.1f}s")
+    else:
+        if eval_only:
+            raise ValueError(
+                "--eval_only_checkpoint requested but "
+                "--load_fast_graph_checkpoint was not provided. "
+                "Pass --load_fast_graph_checkpoint PATH to load a saved checkpoint."
+            )
+
+        # ---- 3. Build or load cached train / val datasets ----
+        print(f"\n  [fast_final_graph] Building training dataset...")
+        t0 = time.time()
+
+        # Split train_samples into train / val for early stopping
+        rng = random.Random(split_seed)
+        shuffled = list(train_samples)
+        rng.shuffle(shuffled)
+        n_val = max(1, int(len(shuffled) * val_split))
+        train_subset = shuffled[n_val:]
+        val_subset = shuffled[:n_val]
+
+        # Compute config fingerprint (shared for build & cache).
+        # Include the concrete split IDs so smoke-test caches cannot be reused
+        # accidentally for full runs with the same input result files.
+        fingerprint = compute_config_fingerprint(
+            bge_results_jsonl=bge_results_jsonl,
+            rgcn_results_jsonl=rgcn_results_jsonl,
+            monot5_results_jsonl=monot5_results_jsonl,
+            ppr_results_jsonl=ppr_results_jsonl,
+            train_sample_ids=[s["id"] for s in train_subset],
+            val_sample_ids=[s["id"] for s in val_subset],
+            top_n=top_n,
+            hard_negatives=hard_negatives,
+            min_rgcn_weight=min_rgcn_weight,
+            min_bge_weight=min_bge_weight,
+            split_seed=split_seed,
+            val_split=val_split,
+        )
+        print(f"    Config fingerprint: {fingerprint}")
+
+        # Try loading from cache
+        train_dataset: FastFinalGraphDataset
+        val_dataset: Optional[FastFinalGraphDataset] = None
+        cache_hit = False
+
+        if model_cache_path:
+            cache_path = Path(model_cache_path)
+            if not cache_path.is_absolute():
+                cache_path = output_dir / cache_path
+            cached_train, cached_val, cache_status = load_dataset_cache(
+                cache_path, fingerprint,
+            )
+            if cache_status == "ok" and cached_train is not None:
+                train_dataset = cached_train
+                val_dataset = cached_val
+                cache_hit = True
+                print(f"    [fast_final_graph] Dataset cache HIT: {cache_path}")
+                print(f"    Train pairs: {train_dataset.num_pairs} "
+                      f"(from {len(train_subset)} queries)")
+                if val_dataset is not None:
+                    print(f"    Val pairs:   {val_dataset.num_pairs} "
+                          f"(from {len(val_subset)} queries)")
+                print(f"    Dataset load time: {time.time() - t0:.1f}s")
+            else:
+                print(f"    [fast_final_graph] Dataset cache MISS: {cache_status}")
+                if cache_status.startswith("fingerprint mismatch"):
+                    print(f"    [fast_final_graph] Cached={cache_status.split('cached=')[1].split(' ')[0] if 'cached=' in cache_status else '?'}")
+                    print(f"    [fast_final_graph] Expected={fingerprint}")
+
+        if not cache_hit:
+            train_dataset = FastFinalGraphDataset(
+                train_subset, gold_map, chunk_by_id,
+                bge_results, rgcn_results, monot5_results,
+                ppr_results=ppr_results,
+                hard_negatives=hard_negatives, top_n=top_n,
+            )
+            print(f"    Train pairs: {train_dataset.num_pairs} "
+                  f"(from {len(train_subset)} queries)")
+
+            if len(val_subset) > 0:
+                try:
+                    val_dataset = FastFinalGraphDataset(
+                        val_subset, gold_map, chunk_by_id,
+                        bge_results, rgcn_results, monot5_results,
+                        ppr_results=ppr_results,
+                        hard_negatives=hard_negatives, top_n=top_n,
+                    )
+                    print(f"    Val pairs:   {val_dataset.num_pairs} "
+                          f"(from {len(val_subset)} queries)")
+                except ValueError:
+                    print(f"    [fast_final_graph] No val pairs (all queries lack "
+                          f"gold in candidate pool); skipping validation monitoring.")
+
+            print(f"    Dataset build time: {time.time() - t0:.1f}s")
+
+            # Save to cache
+            if model_cache_path:
+                cache_path = Path(model_cache_path)
+                if not cache_path.is_absolute():
+                    cache_path = output_dir / cache_path
+                try:
+                    save_dataset_cache(
+                        cache_path, train_dataset, val_dataset,
+                        fingerprint, meta={"train_subset_size": len(train_subset)},
+                    )
+                    print(f"    [fast_final_graph] Dataset cache saved: {cache_path}")
+                except Exception as exc:
+                    print(f"    [fast_final_graph] WARNING: Failed to save dataset cache: {exc}")
+
+        # ---- 4. Train ----
+        print(f"\n  [fast_final_graph] Training...")
+        print(f"    Epochs: {epochs}, batch_size: {batch_size}, lr: {lr}")
+        print(f"    min_rgcn_weight: {min_rgcn_weight}, "
+              f"min_bge_weight: {min_bge_weight}")
+        print(f"    max_entity_weight: {max_entity_weight}, "
+              f"delta_scale: {delta_scale}")
+        t0 = time.time()
+
+        train_losses, val_losses = train_fast_final_graph(
+            model, train_dataset, val_dataset,
+            epochs=epochs, batch_size=batch_size, lr=lr,
+            device=device, verbose=True,
+        )
+        train_time = time.time() - t0
+        print(f"    Training done in {train_time:.1f}s "
+              f"({train_time / 60:.1f}m)")
+
+        meta["train_time_s"] = round(train_time, 1)
+        meta["final_train_loss"] = round(train_losses[-1], 6) if train_losses else None
+        if val_losses:
+            meta["final_val_loss"] = round(val_losses[-1], 6)
+
+        # ---- 5. Compute average learned weights ----
+        print(f"\n  [fast_final_graph] Computing average learned weights...")
+        from torch.utils.data import DataLoader as _FFGDataLoader
+        train_loader = _FFGDataLoader(
+            train_dataset, batch_size=batch_size, shuffle=False,
+        )
+        avg_weights = model.compute_average_weights(train_loader, device=device)
+        for k, v in avg_weights.items():
+            print(f"    {k}: {v:.4f}")
+        meta.update(avg_weights)
+
+    # ---- 6. Evaluate ----
+    print(f"\n  [fast_final_graph] Evaluating on {len(eval_samples)} samples...")
+    t0 = time.time()
+
+    partial_path = output_dir / "fast_final_graph_results.jsonl.partial"
+
+    results = evaluate_fast_final_graph(
+        model, eval_samples, gold_map, chunk_by_id,
+        bge_results, rgcn_results, monot5_results,
+        ppr_results=ppr_results,
+        top_n=top_n, output_k=output_k, device=device,
+        batch_size=batch_size, progress_every=progress_every,
+        partial_output_path=partial_path,
+    )
+    eval_time = time.time() - t0
+    print(f"    Evaluation done in {eval_time:.1f}s ({eval_time / 60:.1f}m)")
+    meta["eval_time_s"] = round(eval_time, 1)
+
+    total_time = time.time() - t_total
+    print(f"    Total time: {total_time:.1f}s ({total_time / 60:.1f}m)")
+    meta["total_time_s"] = round(total_time, 1)
+
+    return results, model, meta
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1087,6 +1529,278 @@ def _load_rgcn_checkpoint(
     return RGCNFusionReranker.load(checkpoint_path, model=model, device=device)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# QFE-RGCN checkpoint loading & score cache helpers
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _compute_file_hash(file_path: Path) -> str:
+    """Compute a stable hash of a file for cache identification.
+
+    Hashes the first 64 KiB of content plus file mtime and size so that
+    the same checkpoint file always maps to the same hash.
+    """
+    stat = file_path.stat()
+    h = hashlib.sha256()
+    with open(file_path, "rb") as fh:
+        h.update(fh.read(65536))
+    h.update(str(stat.st_mtime).encode())
+    h.update(str(stat.st_size).encode())
+    return h.hexdigest()[:16]
+
+
+def _compute_qfe_config_hash(
+    query_embed_dim: int,
+    relation_map: Dict[str, int],
+    gnn_hidden: int,
+    gnn_out_dim: int,
+    base_feat_dim: int,
+) -> str:
+    """Hash the QFE model architecture configuration for cache key derivation."""
+    parts = [
+        str(query_embed_dim),
+        json.dumps(dict(sorted(relation_map.items())), sort_keys=True),
+        str(gnn_hidden),
+        str(gnn_out_dim),
+        str(base_feat_dim),
+    ]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+def _compute_qfe_score_cache_key(
+    question_id: str,
+    candidate_ids: List[str],
+    checkpoint_hash: str,
+    method_name: str,
+    use_ppr: bool,
+    top_n: int,
+    output_k: int,
+    config_hash: str,
+) -> str:
+    """Derive a deterministic cache key for a single query's QFE rerank result."""
+    parts = [
+        question_id,
+        _fingerprint_ids(candidate_ids),
+        checkpoint_hash,
+        method_name,
+        str(int(use_ppr)),
+        str(top_n),
+        str(output_k),
+        config_hash,
+    ]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:24]
+
+
+def _load_qfe_score_cache(cache_dir: Path, method_name: str) -> Dict[str, Dict]:
+    """Load QFE score cache from a JSON file.  Returns dict keyed by cache_key."""
+    cache_file = cache_dir / f"{method_name}.json"
+    if not cache_file.exists():
+        return {}
+    try:
+        with open(cache_file, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _save_qfe_score_cache(cache_dir: Path, method_name: str, cache: Dict[str, Dict]) -> None:
+    """Atomically write QFE score cache to disk."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{method_name}.json"
+    tmp_file = cache_dir / f"{method_name}.json.tmp"
+    with open(tmp_file, "w", encoding="utf-8") as fh:
+        json.dump(cache, fh, ensure_ascii=False)
+    tmp_file.replace(cache_file)
+
+
+def _load_qfe_reranker_from_checkpoint(
+    checkpoint_path: str | Path,
+    feature_dim: int,
+    cfg: Config,
+    device: str,
+) -> Tuple[QFERGCNFusionReranker, Dict]:
+    """Load a QFE-RGCN reranker from a saved checkpoint.
+
+    Infers model/scoring-head dimensions from the stored state dicts so the
+    caller does not need to track architecture hyperparameters separately.
+    """
+    import torch
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model_state = ckpt["model_state"]
+    scoring_head_state = ckpt["scoring_head_state"]
+
+    # Infer dimensions from saved parameter shapes
+    in_dim: int = model_state["conv1.self_loop.weight"].shape[1]
+    hidden_dim: int = model_state["conv1.self_loop.weight"].shape[0]
+    out_dim: int = model_state["conv2.self_loop.weight"].shape[0]
+    base_feat_dim: int = scoring_head_state["chunk_proj.0.weight"].shape[1]
+
+    # Validate that checkpoint in_dim matches current feature_dim
+    expected_in_dim = feature_dim + QUERY_FEATURE_DIM
+    if in_dim != expected_in_dim:
+        raise ValueError(
+            f"QFE checkpoint in_dim mismatch: "
+            f"checkpoint in_dim={in_dim}, "
+            f"current feature_dim={feature_dim}, "
+            f"QUERY_FEATURE_DIM={QUERY_FEATURE_DIM}, "
+            f"expected_in_dim={expected_in_dim}. "
+            f"The graph feature cache / embedding dim does not match the "
+            f"checkpoint. Rebuild with matching --graph_feature_retriever_cache "
+            f"or re-train."
+        )
+
+    relation_map: Dict[str, int] = ckpt.get("relation_map", {})
+    num_relations = max(relation_map.values()) + 1 if relation_map else 1
+    query_embed_dim: int = ckpt.get("query_embed_dim", QUERY_EMBED_DIM)
+
+    # Build model architecture matching the checkpoint
+    gnn_model = QFERGCNReranker(
+        in_dim=in_dim,
+        hidden_dim=hidden_dim,
+        out_dim=out_dim,
+        num_relations=num_relations,
+        query_embed_dim=query_embed_dim,
+        dropout=cfg.rerank.get("gnn_dropout", 0.3),
+    )
+    scoring_head = EntityGatedScoringHead(
+        query_embed_dim=query_embed_dim,
+        chunk_proj_dim=64,
+        gnn_out_dim=out_dim,
+        base_feat_dim=base_feat_dim,
+        hidden_dim=hidden_dim,
+        dropout=cfg.rerank.get("gnn_dropout", 0.3),
+    )
+
+    # Restore parameters
+    gnn_model.load_state_dict(model_state)
+    scoring_head.load_state_dict(scoring_head_state)
+
+    query_embeddings: Dict[str, np.ndarray] = {}
+
+    reranker = QFERGCNFusionReranker(
+        model=gnn_model,
+        scoring_head=scoring_head,
+        relation_map=relation_map,
+        query_embeddings=query_embeddings,
+        query_embed_dim=query_embed_dim,
+        device=device,
+    )
+
+    meta = {
+        "checkpoint_path": str(checkpoint_path),
+        "in_dim": in_dim,
+        "hidden_dim": hidden_dim,
+        "out_dim": out_dim,
+        "base_feat_dim": base_feat_dim,
+        "num_relations": num_relations,
+        "query_embed_dim": query_embed_dim,
+    }
+    return reranker, meta
+
+
+def _load_qfe_v2_reranker_from_checkpoint(
+    checkpoint_path: str | Path,
+    feature_dim: int,
+    cfg: Config,
+    device: str,
+) -> Tuple[QFERGCNFusionRerankerV2, Dict]:
+    """Load a QFE-RGCN v2 reranker from a saved checkpoint.
+
+    Infers dimensions from stored state dicts and reconstructs the full
+    v2 architecture (QFERGCNReranker + EntityGatedScoringHead +
+    RetrievalPreservedFusionHead + gnn_proj).
+    """
+    import torch
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    version = ckpt.get("version", 1)
+    if version != 2:
+        raise ValueError(
+            f"Expected v2 checkpoint (version=2), got version={version}. "
+            f"Use --load_qfe_checkpoint with a v1 checkpoint for qfe_rgcn."
+        )
+
+    model_state = ckpt["model_state"]
+    scoring_head_state = ckpt["scoring_head_state"]
+    fusion_head_state = ckpt["fusion_head_state"]
+    gnn_proj_state = ckpt["gnn_proj_state"]
+
+    # Infer dimensions
+    in_dim: int = model_state["conv1.self_loop.weight"].shape[1]
+    hidden_dim: int = model_state["conv1.self_loop.weight"].shape[0]
+    out_dim: int = model_state["conv2.self_loop.weight"].shape[0]
+    base_feat_dim: int = scoring_head_state["chunk_proj.0.weight"].shape[1]
+
+    # Validate dimension match
+    expected_in_dim = feature_dim + QUERY_FEATURE_DIM
+    if in_dim != expected_in_dim:
+        raise ValueError(
+            f"QFE v2 checkpoint in_dim mismatch: "
+            f"checkpoint in_dim={in_dim}, "
+            f"current feature_dim={feature_dim}, "
+            f"QUERY_FEATURE_DIM={QUERY_FEATURE_DIM}, "
+            f"expected_in_dim={expected_in_dim}."
+        )
+
+    relation_map: Dict[str, int] = ckpt.get("relation_map", {})
+    num_relations = max(relation_map.values()) + 1 if relation_map else 1
+    query_embed_dim: int = ckpt.get("query_embed_dim", QUERY_EMBED_DIM)
+    min_ret_weight: float = ckpt.get("min_retrieval_weight", 0.35)
+
+    # Build architecture
+    gnn_model = QFERGCNReranker(
+        in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim,
+        num_relations=num_relations, query_embed_dim=query_embed_dim,
+        dropout=cfg.rerank.get("gnn_dropout", 0.3),
+    )
+    scoring_head = EntityGatedScoringHead(
+        query_embed_dim=query_embed_dim, chunk_proj_dim=64,
+        gnn_out_dim=out_dim, base_feat_dim=base_feat_dim,
+        hidden_dim=hidden_dim, dropout=cfg.rerank.get("gnn_dropout", 0.3),
+    )
+    fusion_head = RetrievalPreservedFusionHead(
+        query_embed_dim=query_embed_dim, hidden_dim=64,
+        min_ret_weight=min_ret_weight, dropout=0.1,
+    )
+    gnn_proj = nn.Linear(out_dim, 1)
+
+    # Restore parameters
+    gnn_model.load_state_dict(model_state)
+    scoring_head.load_state_dict(scoring_head_state)
+    fusion_head.load_state_dict(fusion_head_state)
+    gnn_proj.load_state_dict(gnn_proj_state)
+
+    # Optional BGE projection
+    query_projection = None
+    if "query_projection_state" in ckpt:
+        proj_state = ckpt["query_projection_state"]
+        bge_dim = proj_state["weight"].shape[1]
+        query_projection = nn.Linear(bge_dim, query_embed_dim).to(device)
+        query_projection.load_state_dict(proj_state)
+
+    query_embeddings: Dict[str, np.ndarray] = {}
+
+    reranker = QFERGCNFusionRerankerV2(
+        model=gnn_model, scoring_head=scoring_head,
+        fusion_head=fusion_head, gnn_proj=gnn_proj,
+        relation_map=relation_map, query_embeddings=query_embeddings,
+        query_embed_dim=query_embed_dim,
+        min_retrieval_weight=min_ret_weight, delta_reg=0.05,
+        device=device, query_projection=query_projection,
+        query_encoder=ckpt.get("query_encoder", "heuristic"),
+        query_embedding_dim_raw=ckpt.get("query_embedding_dim_raw"),
+    )
+
+    meta = {
+        "checkpoint_path": str(checkpoint_path), "version": 2,
+        "in_dim": in_dim, "hidden_dim": hidden_dim, "out_dim": out_dim,
+        "base_feat_dim": base_feat_dim, "num_relations": num_relations,
+        "query_embed_dim": query_embed_dim,
+        "min_retrieval_weight": min_ret_weight,
+    }
+    return reranker, meta
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Table 1: Non-LLM Reranking Comparison"
@@ -1130,7 +1844,7 @@ def main() -> None:
     parser.add_argument("--candidate_pool_name", default="CandidatePool",
                         help="Display name for --candidate_results_jsonl")
     parser.add_argument("--methods", default="best_retriever,cross_encoder,ppr,graphsage,rgcn,rgcn_constraint",
-                        help="Comma-separated methods to run (available: best_retriever, cross_encoder, ppr, graphsage, rgcn, rgcn_constraint, qfe_rgcn, qfe_rgcn_ppr, mono_t5, list_t5)")
+                        help="Comma-separated methods to run (available: best_retriever, cross_encoder, ppr, graphsage, rgcn, rgcn_constraint, qfe_rgcn, qfe_rgcn_v2, qfe_rgcn_ppr, mono_t5, list_t5, fast_final_graph)")
     parser.add_argument("--load_graphsage_checkpoint", default=None,
                         help="Load a saved GraphSAGE checkpoint and evaluate without retraining")
     parser.add_argument("--load_rgcn_checkpoint", default=None,
@@ -1182,7 +1896,56 @@ def main() -> None:
     parser.add_argument("--rebuild_rerank_score_cache", action="store_true",
                         help="Rebuild MonoT5/ListT5 cache even if it exists")
     parser.add_argument("--resume_rerank", action="store_true",
-                        help="Resume MonoT5/ListT5 from partial cache")
+                        help="Resume reranking from partial cache (MonoT5/ListT5/QFE-RGCN)")
+    parser.add_argument("--load_qfe_checkpoint", default=None,
+                        help="Load a saved QFE-RGCN checkpoint and evaluate without retraining")
+    parser.add_argument("--qfe_score_cache", default=None,
+                        help="Cache directory for QFE rerank scores to avoid recomputation")
+    parser.add_argument("--qfe_eval_subgraph_cache", default=None,
+                        help="Cache directory for QFE eval subgraphs (optional, experimental)")
+
+    # ---- QFE-RGCN v2 specific ----
+    parser.add_argument("--qfe_delta_reg", type=float, default=0.05,
+                        help="Delta regularisation weight for v2 (default 0.05)")
+    parser.add_argument("--qfe_min_retrieval_weight", type=float, default=0.35,
+                        help="Floor on retrieval weight in v2 fusion (default 0.35)")
+    parser.add_argument("--gnn_negatives_per_positive", type=int, default=5,
+                        help="Hard negatives per positive for QFE training (default 5)")
+    parser.add_argument("--qfe_query_encoder", default="heuristic",
+                        choices=["heuristic", "bge"],
+                        help="Query encoder for QFE-RGCN v2: heuristic or bge (BGE-M3)")
+    parser.add_argument("--qfe_query_embedding_cache", default="cache/query_embeddings/bge_m3_queries.pkl",
+                        help="Pickle cache for BGE query embeddings")
+
+    # ---- Fast Final Graph ----
+    parser.add_argument("--fast_graph_rgcn_results_jsonl", default=None,
+                        help="R-GCN results JSONL for Fast Final Graph feature extraction")
+    parser.add_argument("--fast_graph_monot5_results_jsonl", default=None,
+                        help="MonoT5 results JSONL for Fast Final Graph feature extraction")
+    parser.add_argument("--fast_graph_ppr_results_jsonl", default=None,
+                        help="PPR results JSONL for Fast Final Graph (optional; graph source disabled if omitted)")
+    parser.add_argument("--fast_graph_model_cache", default=None,
+                        help="Pickle cache path for Fast Final Graph training dataset")
+    parser.add_argument("--fast_graph_epochs", type=int, default=20,
+                        help="Training epochs for Fast Final Graph (default 20)")
+    parser.add_argument("--fast_graph_batch_size", type=int, default=512,
+                        help="Batch size for Fast Final Graph training (default 512)")
+    parser.add_argument("--fast_graph_lr", type=float, default=1e-3,
+                        help="Learning rate for Fast Final Graph (default 1e-3)")
+    parser.add_argument("--fast_graph_min_rgcn_weight", type=float, default=0.35,
+                        help="Minimum weight floor for R-GCN source (default 0.35)")
+    parser.add_argument("--fast_graph_min_bge_weight", type=float, default=0.15,
+                        help="Minimum weight floor for BGE source (default 0.15)")
+    parser.add_argument("--fast_graph_max_entity_weight", type=float, default=0.10,
+                        help="Maximum weight cap for entity heuristic source (default 0.10)")
+    parser.add_argument("--fast_graph_delta_scale", type=float, default=0.05,
+                        help="Scale for bounded tanh residual delta (default 0.05)")
+    parser.add_argument("--fast_graph_hard_negatives", type=int, default=10,
+                        help="Hard negatives per positive for Fast Final Graph (default 10)")
+    parser.add_argument("--fast_graph_eval_split", default="all", choices=["all", "heldout"],
+                        help="Evaluation split for Fast Final Graph: all or heldout (default all)")
+    parser.add_argument("--load_fast_graph_checkpoint", default=None,
+                        help="Load a saved Fast Final Graph checkpoint and evaluate without retraining")
     args = parser.parse_args()
 
     cfg = Config.from_yaml(args.config)
@@ -1505,33 +2268,80 @@ def main() -> None:
             else:
                 print("    [SKIP] R-GCN training failed (not enough pairs)")
 
-        # Train QFE-RGCN (covers both "qfe_rgcn" and "qfe_rgcn_ppr")
+        # Train / Load QFE-RGCN (covers both "qfe_rgcn" and "qfe_rgcn_ppr")
         if "qfe_rgcn" in selected_methods or "qfe_rgcn_ppr" in selected_methods:
-            print("\n  [qfe_rgcn] Training QFE-RGCN reranker...")
-            print(f"    [qfe_rgcn] PPR: {'enabled (--qfe_use_ppr)' if args.qfe_use_ppr else 'disabled (default)'}")
-            print(f"    [qfe_rgcn] Fallback: {'enabled (--allow_rerank_fallback)' if args.allow_rerank_fallback else 'disabled (default, fail-fast)'}")
-            print(f"    [qfe_rgcn] batch_size: 1 (forced — query-aware relation gates are per-query)")
-            t0 = time.time()
-            cfg.rerank["gnn_model"] = "qfe_rgcn"
+            qfe_score_cache_path: Optional[Path] = None
+            if args.qfe_score_cache:
+                qfe_score_cache_path = _resolve_cache_path(args.qfe_score_cache, cfg)
 
-            # Pre-compute query embeddings for all samples
-            all_questions = [s["question"] for s in train_samples]
-            qfe_query_embeddings = build_query_embedding_cache(all_questions)
-            print(f"    Query embeddings: {len(qfe_query_embeddings)} unique queries "
-                  f"(dim={QUERY_EMBED_DIM})")
+            # Track which checkpoint to use for score cache
+            _qfe_checkpoint_for_cache: Optional[str] = args.load_qfe_checkpoint
 
-            qfe_reranker, qfe_history, qfe_meta = train_gnn_reranker(
-                train_samples, candidate_retriever, graph, features, gold_map, cfg,
-                epochs=cfg.rerank.get("gnn_epochs", 10),
-                device=device, min_pairs=5, verbose=True,
-                query_embeddings=qfe_query_embeddings,
-            )
-            if qfe_reranker is not None:
-                save_training_artifacts(
-                    qfe_reranker, qfe_history, output_dir, qfe_meta,
-                    experiment="table1_qfe_rgcn",
+            if args.load_qfe_checkpoint:
+                # ---- eval-only: load checkpoint, skip training ----
+                print("\n  [qfe_rgcn] Loading QFE-RGCN checkpoint (eval-only)...")
+                print(f"    [qfe_rgcn] Checkpoint: {args.load_qfe_checkpoint}")
+                print(f"    [qfe_rgcn] PPR: {'enabled (--qfe_use_ppr)' if args.qfe_use_ppr else 'disabled (default)'}")
+                print(f"    [qfe_rgcn] Fallback: {'enabled (--allow_rerank_fallback)' if args.allow_rerank_fallback else 'disabled (default, fail-fast)'}")
+                t0 = time.time()
+                qfe_reranker, qfe_meta = _load_qfe_reranker_from_checkpoint(
+                    args.load_qfe_checkpoint,
+                    feature_dim=feature_dim,
+                    cfg=cfg,
+                    device=device,
                 )
-                print(f"    Training done in {time.time() - t0:.1f}s")
+                print(f"    Loaded in {time.time() - t0:.1f}s "
+                      f"(relations={qfe_meta['num_relations']}, "
+                      f"query_embed_dim={qfe_meta['query_embed_dim']})")
+
+                # Build query embeddings for eval samples
+                qfe_query_embeddings = build_query_embedding_cache(
+                    [s["question"] for s in eval_samples]
+                )
+                for q, emb in qfe_query_embeddings.items():
+                    qfe_reranker.query_embeddings[q] = emb
+
+            else:
+                if args.eval_only_checkpoint:
+                    raise ValueError(
+                        "--eval_only_checkpoint requested but "
+                        "--load_qfe_checkpoint was not provided for qfe_rgcn/qfe_rgcn_ppr. "
+                        "Pass --load_qfe_checkpoint PATH to load a saved QFE-RGCN checkpoint."
+                    )
+
+                # ---- train from scratch ----
+                print("\n  [qfe_rgcn] Training QFE-RGCN reranker...")
+                print(f"    [qfe_rgcn] PPR: {'enabled (--qfe_use_ppr)' if args.qfe_use_ppr else 'disabled (default)'}")
+                print(f"    [qfe_rgcn] Fallback: {'enabled (--allow_rerank_fallback)' if args.allow_rerank_fallback else 'disabled (default, fail-fast)'}")
+                print(f"    [qfe_rgcn] batch_size: 1 (forced — query-aware relation gates are per-query)")
+                t0 = time.time()
+                cfg.rerank["gnn_model"] = "qfe_rgcn"
+
+                # Pre-compute query embeddings for all samples
+                all_questions = [s["question"] for s in train_samples]
+                qfe_query_embeddings = build_query_embedding_cache(all_questions)
+                print(f"    Query embeddings: {len(qfe_query_embeddings)} unique queries "
+                      f"(dim={QUERY_EMBED_DIM})")
+
+                qfe_reranker, qfe_history, qfe_meta = train_gnn_reranker(
+                    train_samples, candidate_retriever, graph, features, gold_map, cfg,
+                    epochs=cfg.rerank.get("gnn_epochs", 10),
+                    device=device, min_pairs=5, verbose=True,
+                    query_embeddings=qfe_query_embeddings,
+                )
+
+            if qfe_reranker is not None:
+                if not args.load_qfe_checkpoint:
+                    qfe_artifacts = save_training_artifacts(
+                        qfe_reranker, qfe_history, output_dir, qfe_meta,
+                        experiment="table1_qfe_rgcn",
+                    )
+                    print(f"    Training done in {time.time() - t0:.1f}s")
+                    # Use the newly saved checkpoint for score cache
+                    _qfe_checkpoint_for_cache = str(qfe_artifacts["checkpoint"])
+                    if qfe_score_cache_path is not None:
+                        print(f"    [qfe_rgcn] Using checkpoint for score cache: "
+                              f"{_qfe_checkpoint_for_cache}")
 
                 # Add eval queries to query_embeddings
                 for s in eval_samples:
@@ -1540,6 +2350,23 @@ def main() -> None:
                         qfe_reranker.query_embeddings[q] = derive_query_vector(
                             q, dim=qfe_reranker.query_embed_dim,
                         )
+
+                # Resolve score cache path for eval
+                _qfe_score_cache: Optional[Path] = None
+                if args.qfe_score_cache:
+                    _qfe_score_cache = _resolve_cache_path(args.qfe_score_cache, cfg)
+
+                # Common kwargs for run_qfe_rgcn
+                if _qfe_score_cache is not None and _qfe_checkpoint_for_cache:
+                    print(f"    [qfe_rgcn] Using checkpoint for score cache: "
+                          f"{_qfe_checkpoint_for_cache}")
+                qfe_eval_kwargs = dict(
+                    progress_every=args.rerank_checkpoint_every,
+                    partial_output_dir=output_dir,
+                    resume_rerank=args.resume_rerank,
+                    score_cache_path=_qfe_score_cache,
+                    checkpoint_path=_qfe_checkpoint_for_cache,
+                )
 
                 if "qfe_rgcn" in selected_methods:
                     print(f"    Evaluating QFE-RGCN on {len(eval_samples)} samples...")
@@ -1552,6 +2379,7 @@ def main() -> None:
                         ppr_alpha=cfg.rerank.get("ppr_alpha", 0.85),
                         use_ppr=args.qfe_use_ppr,
                         allow_fallback=args.allow_rerank_fallback,
+                        **qfe_eval_kwargs,
                     )
                     print(f"    Evaluation done in {time.time() - t_eval:.1f}s")
                     _checkpoint_method(output_dir, "qfe_rgcn", all_results, k_values)
@@ -1568,13 +2396,263 @@ def main() -> None:
                         ppr_alpha=cfg.rerank.get("ppr_alpha", 0.85),
                         use_ppr=True,
                         allow_fallback=args.allow_rerank_fallback,
+                        **qfe_eval_kwargs,
                     )
                     print(f"    Evaluation done in {time.time() - t_eval2:.1f}s")
                     _checkpoint_method(output_dir, "qfe_rgcn_ppr", all_results, k_values)
             else:
                 print("    [SKIP] QFE-RGCN training failed (not enough pairs)")
+
+        # ---- Train / Load QFE-RGCN v2 ----
+        if "qfe_rgcn_v2" in selected_methods:
+            _v2_score_cache: Optional[Path] = None
+            if args.qfe_score_cache:
+                _v2_score_cache = _resolve_cache_path(args.qfe_score_cache, cfg)
+
+            # Determine which checkpoint to use for score cache
+            _v2_checkpoint_for_cache: Optional[str] = args.load_qfe_checkpoint
+
+            if args.load_qfe_checkpoint:
+                # ---- eval-only: load v2 checkpoint ----
+                print("\n  [qfe_rgcn_v2] Loading QFE-RGCN v2 checkpoint (eval-only)...")
+                print(f"    [qfe_rgcn_v2] Checkpoint: {args.load_qfe_checkpoint}")
+                t0 = time.time()
+                qfe_v2_reranker, qfe_v2_meta = _load_qfe_v2_reranker_from_checkpoint(
+                    args.load_qfe_checkpoint,
+                    feature_dim=feature_dim,
+                    cfg=cfg,
+                    device=device,
+                )
+                print(f"    Loaded in {time.time() - t0:.1f}s "
+                      f"(v{qfe_v2_meta['version']}, "
+                      f"relations={qfe_v2_meta['num_relations']}, "
+                      f"query_embed_dim={qfe_v2_meta['query_embed_dim']})")
+
+                # Build query embeddings for eval — must match checkpoint encoder
+                if (qfe_v2_reranker.query_projection is not None
+                        or qfe_v2_reranker.query_encoder == "bge"):
+                    print(f"    [qfe_rgcn_v2] Building BGE query embeddings for eval...")
+                    qfe_v2_query_embeddings = build_bge_query_embedding_cache(
+                        [s["question"] for s in eval_samples],
+                        device=device,
+                        cache_path=args.qfe_query_embedding_cache,
+                        fail_on_missing_model=True,
+                    )
+                else:
+                    qfe_v2_query_embeddings = build_query_embedding_cache(
+                        [s["question"] for s in eval_samples]
+                    )
+                for q, emb in qfe_v2_query_embeddings.items():
+                    qfe_v2_reranker.query_embeddings[q] = emb
+
+            else:
+                if args.eval_only_checkpoint:
+                    raise ValueError(
+                        "--eval_only_checkpoint requested but "
+                        "--load_qfe_checkpoint was not provided for qfe_rgcn_v2."
+                    )
+
+                # ---- train v2 from scratch ----
+                print("\n  [qfe_rgcn_v2] Training QFE-RGCN v2 reranker...")
+                print(f"    [qfe_rgcn_v2] query_encoder: {args.qfe_query_encoder}")
+                print(f"    [qfe_rgcn_v2] min_retrieval_weight: {args.qfe_min_retrieval_weight}")
+                print(f"    [qfe_rgcn_v2] delta_reg: {args.qfe_delta_reg}")
+                print(f"    [qfe_rgcn_v2] negatives_per_positive: {args.gnn_negatives_per_positive}")
+                print(f"    [qfe_rgcn_v2] batch_size: 1 (forced)")
+                t0 = time.time()
+                cfg.rerank["gnn_model"] = "qfe_rgcn_v2"
+
+                # Build BGE embeddings for train + eval (so eval queries are ready)
+                qfe_v2_query_embeddings = None
+                if args.qfe_query_encoder == "bge":
+                    all_questions = [s["question"] for s in train_samples + eval_samples]
+                    qfe_v2_query_embeddings = build_bge_query_embedding_cache(
+                        all_questions,
+                        device=device,
+                        cache_path=args.qfe_query_embedding_cache,
+                        fail_on_missing_model=True,
+                    )
+                    print(f"    BGE query embeddings: {len(qfe_v2_query_embeddings)} unique "
+                          f"(train+eval)")
+
+                qfe_v2_reranker, qfe_v2_history, qfe_v2_meta = train_gnn_reranker(
+                    train_samples, candidate_retriever, graph, features, gold_map, cfg,
+                    epochs=cfg.rerank.get("gnn_epochs", 10),
+                    device=device, min_pairs=5, verbose=True,
+                    query_embeddings=qfe_v2_query_embeddings,
+                    negatives_per_positive=args.gnn_negatives_per_positive,
+                    min_retrieval_weight=args.qfe_min_retrieval_weight,
+                    delta_reg=args.qfe_delta_reg,
+                    query_encoder=args.qfe_query_encoder,
+                    query_embedding_cache=args.qfe_query_embedding_cache,
+                )
+
+            if qfe_v2_reranker is not None:
+                if not args.load_qfe_checkpoint:
+                    v2_artifacts = save_training_artifacts(
+                        qfe_v2_reranker, qfe_v2_history, output_dir, qfe_v2_meta,
+                        experiment="table1_qfe_rgcn_v2",
+                    )
+                    print(f"    Training done in {time.time() - t0:.1f}s")
+                    # Use the newly saved checkpoint for score cache
+                    _v2_checkpoint_for_cache = str(v2_artifacts["checkpoint"])
+                    if _v2_score_cache is not None:
+                        print(f"    [qfe_rgcn_v2] Using checkpoint for score cache: "
+                              f"{_v2_checkpoint_for_cache}")
+
+                # Add eval queries to query_embeddings — must match encoder
+                if qfe_v2_reranker.query_projection is not None:
+                    # BGE: all queries should already be in cache from build step above
+                    for s in eval_samples:
+                        q = s["question"]
+                        if q not in qfe_v2_reranker.query_embeddings:
+                            raise ValueError(
+                                f"Eval query '{q[:80]}...' missing from BGE query "
+                                f"embedding cache.  Rebuild with "
+                                f"--qfe_query_embedding_cache."
+                            )
+                else:
+                    # Heuristic: fill missing with derive_query_vector
+                    for s in eval_samples:
+                        q = s["question"]
+                        if q not in qfe_v2_reranker.query_embeddings:
+                            qfe_v2_reranker.query_embeddings[q] = derive_query_vector(
+                                q, dim=qfe_v2_reranker.query_embed_dim,
+                            )
+
+                if _v2_score_cache is not None and _v2_checkpoint_for_cache:
+                    print(f"    [qfe_rgcn_v2] Using checkpoint for score cache: "
+                          f"{_v2_checkpoint_for_cache}")
+
+                v2_eval_kwargs = dict(
+                    progress_every=args.rerank_checkpoint_every,
+                    partial_output_dir=output_dir,
+                    resume_rerank=args.resume_rerank,
+                    score_cache_path=_v2_score_cache,
+                    checkpoint_path=_v2_checkpoint_for_cache,
+                )
+
+                print(f"    Evaluating QFE-RGCN v2 on {len(eval_samples)} samples...")
+                t_eval = time.time()
+                all_results["qfe_rgcn_v2"] = run_qfe_rgcn(
+                    eval_samples, candidate_retriever, graph, features, gold_map,
+                    chunk_by_id, extractor, qfe_v2_reranker,
+                    qfe_v2_reranker.query_embeddings,
+                    method_name="qfe_rgcn_v2",
+                    top_n=args.top_n, output_k=args.output_k,
+                    ppr_alpha=cfg.rerank.get("ppr_alpha", 0.85),
+                    use_ppr=False,
+                    allow_fallback=args.allow_rerank_fallback,
+                    **v2_eval_kwargs,
+                )
+                print(f"    Evaluation done in {time.time() - t_eval:.1f}s")
+                _checkpoint_method(output_dir, "qfe_rgcn_v2", all_results, k_values)
+            else:
+                print("    [SKIP] QFE-RGCN v2 training failed (not enough pairs)")
     else:
         print("\n  [skip_gnn] Skipping GraphSAGE, R-GCN, and R-GCN+Constraint.")
+
+    # ---- Fast Final Graph (lightweight fusion, no GNN needed) ----
+    if "fast_final_graph" in selected_methods:
+        if not args.candidate_results_jsonl:
+            raise ValueError(
+                "Fast Final Graph requires a fixed BGE candidate pool. "
+                "Pass --candidate_results_jsonl pointing to bge_m3_dense_results.jsonl."
+            )
+        if not args.fast_graph_rgcn_results_jsonl:
+            raise ValueError(
+                "Fast Final Graph requires R-GCN results. "
+                "Pass --fast_graph_rgcn_results_jsonl."
+            )
+        if not args.fast_graph_monot5_results_jsonl:
+            raise ValueError(
+                "Fast Final Graph requires MonoT5 results. "
+                "Pass --fast_graph_monot5_results_jsonl."
+            )
+
+        print(f"\n  [fast_final_graph] Fast Final Graph (Ours)")
+        print(f"    [fast_final_graph] epochs: {args.fast_graph_epochs}, "
+              f"batch_size: {args.fast_graph_batch_size}, lr: {args.fast_graph_lr}")
+        print(f"    [fast_final_graph] min_rgcn_weight: {args.fast_graph_min_rgcn_weight}, "
+              f"min_bge_weight: {args.fast_graph_min_bge_weight}")
+        print(f"    [fast_final_graph] max_entity_weight: {args.fast_graph_max_entity_weight}, "
+              f"delta_scale: {args.fast_graph_delta_scale}")
+        print(f"    [fast_final_graph] hard_negatives: {args.fast_graph_hard_negatives}")
+        if args.fast_graph_ppr_results_jsonl:
+            print(f"    [fast_final_graph] PPR source: {args.fast_graph_ppr_results_jsonl}")
+        if args.fast_graph_model_cache:
+            print(f"    [fast_final_graph] Model cache: {args.fast_graph_model_cache}")
+        if args.load_fast_graph_checkpoint:
+            print(f"    [fast_final_graph] Eval-only: loading {args.load_fast_graph_checkpoint}")
+        fast_graph_eval_samples = eval_samples
+        if args.fast_graph_eval_split == "heldout":
+            fast_graph_eval_samples = test_samples
+        print(f"    [fast_final_graph] eval_split: {args.fast_graph_eval_split} "
+              f"({len(fast_graph_eval_samples)} samples)")
+
+        t0 = time.time()
+
+        # Resolve paths
+        bge_jsonl = str(_resolve_cache_path(args.candidate_results_jsonl, cfg))
+        rgcn_jsonl = str(_resolve_cache_path(args.fast_graph_rgcn_results_jsonl, cfg))
+        monot5_jsonl = str(_resolve_cache_path(args.fast_graph_monot5_results_jsonl, cfg))
+
+        ppr_jsonl: Optional[str] = None
+        if args.fast_graph_ppr_results_jsonl:
+            ppr_jsonl = str(_resolve_cache_path(args.fast_graph_ppr_results_jsonl, cfg))
+
+        model_cache: Optional[str] = None
+        if args.fast_graph_model_cache:
+            model_cache = str(_resolve_cache_path(args.fast_graph_model_cache, cfg))
+
+        ffg_results, ffg_model, ffg_meta = run_fast_final_graph_method(
+            train_samples=train_samples,
+            eval_samples=fast_graph_eval_samples,
+            gold_map=gold_map,
+            chunk_by_id=chunk_by_id,
+            bge_results_jsonl=bge_jsonl,
+            rgcn_results_jsonl=rgcn_jsonl,
+            monot5_results_jsonl=monot5_jsonl,
+            output_dir=output_dir,
+            ppr_results_jsonl=ppr_jsonl,
+            model_cache_path=model_cache,
+            epochs=args.fast_graph_epochs,
+            batch_size=args.fast_graph_batch_size,
+            lr=args.fast_graph_lr,
+            min_rgcn_weight=args.fast_graph_min_rgcn_weight,
+            min_bge_weight=args.fast_graph_min_bge_weight,
+            max_entity_weight=args.fast_graph_max_entity_weight,
+            delta_scale=args.fast_graph_delta_scale,
+            hard_negatives=args.fast_graph_hard_negatives,
+            top_n=args.top_n,
+            output_k=args.output_k,
+            device=device,
+            val_split=args.val_split,
+            split_seed=args.split_seed,
+            load_checkpoint_path=args.load_fast_graph_checkpoint,
+            progress_every=args.rerank_checkpoint_every,
+            eval_only=args.eval_only_checkpoint,
+        )
+
+        all_results["fast_final_graph"] = ffg_results
+
+        # Save checkpoint and artifacts
+        if not args.load_fast_graph_checkpoint and ffg_model is not None:
+            ckpt_dir = output_dir / "model_checkpoints"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ckpt_path = ckpt_dir / f"fast_final_graph_{stamp}.pt"
+            save_checkpoint(ffg_model, ckpt_path, meta=ffg_meta)
+            print(f"    [fast_final_graph] Checkpoint saved: {ckpt_path}")
+
+            # Save loss history
+            history_path = output_dir / f"fast_final_graph_loss_history_{stamp}.json"
+            with open(history_path, "w", encoding="utf-8") as fh:
+                json.dump(ffg_meta, fh, indent=2)
+            print(f"    [fast_final_graph] Loss history saved: {history_path}")
+
+        _checkpoint_method(output_dir, "fast_final_graph", all_results, k_values)
+        print(f"    [fast_final_graph] Total time: {time.time() - t0:.1f}s")
 
     # ---- MonoT5 (BGE-M3 top-50 reranking, Table II) ----
     if "mono_t5" in selected_methods:
@@ -1705,10 +2783,12 @@ def main() -> None:
         "graphsage": "+ GraphSAGE          ",
         "rgcn": "+ R-GCN              ",
         "rgcn_constraint": "+ R-GCN + Constraint ",
-        "qfe_rgcn": "Final Graph (Ours)  ",
-        "qfe_rgcn_ppr": "+ QFE-RGCN + PPR     ",
+        "qfe_rgcn": "Final Graph v1 (Ours)",
+        "qfe_rgcn_v2": "Final Graph v2 (Ours)",
+        "qfe_rgcn_ppr": "+ QFE-RGCN v1 + PPR  ",
         "mono_t5": "MonoT5               ",
         "list_t5": "ListT5               ",
+        "fast_final_graph": "Fast Final Graph (Ours)",
     }
     header = f"{'Method':<30} {'MRR':>7}"
     for k in k_values:
