@@ -1,9 +1,11 @@
-"""Tests for GraphSAGE/GNN reranker (feg_rag.rerank.gnn).
+"""Tests for GraphSAGE / GATv2 / GNN reranker (feg_rag.rerank.gnn).
 
-Covers: self-loop, query-specific features, fusion normalization, API compat.
+Covers: self-loop, query-specific features, fusion normalization, API compat,
+GATv2 forward shape, dense attention masking, multi-head aggregation, param count.
 """
 
 import numpy as np
+import torch
 
 from feg_rag.data.chunker import Chunk
 from feg_rag.graph.builder import FinancialEvidenceGraph
@@ -11,6 +13,8 @@ from feg_rag.rerank.gnn import (
     GraphSAGEReranker,
     GNNFusionReranker,
     RerankDataset,
+    DenseGATv2Layer,
+    GATv2Reranker,
 )
 from feg_rag.rerank.query_features import (
     QUERY_FEATURE_DIM,
@@ -209,6 +213,114 @@ def test_rerank_api():
         assert isinstance(score, float)
     cids = [c.chunk_id for c, _ in result]
     assert set(cids) == {"c_A", "c_B"}
+
+
+# ---------------------------------------------------------------------------
+# GATv2 Tests
+# ---------------------------------------------------------------------------
+
+def test_gatv2_forward_shape():
+    """GATv2Reranker.forward produces expected output shape (N, 1)."""
+    in_dim = 32
+    hidden_dim = 16
+    out_dim = 8
+    heads = 2
+    N = 10
+
+    model = GATv2Reranker(
+        in_dim=in_dim,
+        hidden_dim=hidden_dim,
+        out_dim=out_dim,
+        heads=heads,
+        dropout=0.0,
+    )
+    model.eval()
+
+    x = torch.randn(N, in_dim)
+    adj = torch.eye(N)  # self-loop only, simplified for shape test
+
+    with torch.no_grad():
+        scores = model(x, adj)
+
+    assert scores.shape == (N, 1), f"Expected (N, 1), got {scores.shape}"
+
+
+def test_gatv2_dense_layer_attention_shape():
+    """DenseGATv2Layer produces expected output shapes for concat modes."""
+    in_dim, out_dim, heads, N = 16, 8, 4, 20
+
+    # Test concat=True
+    layer_concat = DenseGATv2Layer(in_dim, out_dim, heads=heads, concat=True)
+    x = torch.randn(N, in_dim)
+    adj = torch.eye(N)  # self-loops
+    adj[0, 1] = adj[1, 0] = 1.0  # add one edge
+    out = layer_concat(x, adj)
+    assert out.shape == (N, heads * out_dim), \
+        f"concat=True: expected ({N}, {heads * out_dim}), got {out.shape}"
+
+    # Test concat=False
+    layer_avg = DenseGATv2Layer(in_dim, out_dim, heads=heads, concat=False)
+    out_avg = layer_avg(x, adj)
+    assert out_avg.shape == (N, out_dim), \
+        f"concat=False: expected ({N}, {out_dim}), got {out_avg.shape}"
+
+
+def test_gatv2_rerank_api():
+    """GNNFusionReranker + GATv2Reranker works with rerank API."""
+    graph = _make_mini_graph()
+    features = _make_features(graph)
+
+    base_dim = next(iter(features.values())).shape[0]
+    model = GATv2Reranker(
+        in_dim=base_dim + QUERY_FEATURE_DIM,
+        hidden_dim=16,
+        out_dim=8,
+        heads=2,
+        dropout=0.0,
+    )
+    reranker = GNNFusionReranker(model, alpha=0.3, beta=0.3, gamma=0.4, device="cpu")
+
+    chunks = [
+        _make_chunk("c_A", "Revenue was $100M in 2023.",
+                     company="Acme Inc", filing_year="2023"),
+        _make_chunk("c_B", "Net income was $20M in 2021.",
+                     company="Acme Inc", filing_year="2021"),
+    ]
+    candidate_chunks = [(chunks[0], 0.9), (chunks[1], 0.5)]
+    ppr_scores = {"c_A": 0.7, "c_B": 0.3}
+
+    result = reranker.rerank(
+        "What was the revenue in 2023?",
+        candidate_chunks,
+        graph,
+        features,
+        ppr_scores=ppr_scores,
+    )
+
+    assert len(result) == 2
+    for chunk, score in result:
+        assert isinstance(chunk, Chunk)
+        assert isinstance(score, float)
+    cids = [c.chunk_id for c, _ in result]
+    assert set(cids) == {"c_A", "c_B"}
+
+
+def test_gatv2_parameter_count():
+    """GATv2 has more parameters than GraphSAGE (multi-head attention)."""
+    in_dim = 32 + QUERY_FEATURE_DIM
+    hidden_dim = 16
+    out_dim = 8
+
+    sage = GraphSAGEReranker(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim)
+    gatv2 = GATv2Reranker(in_dim=in_dim, hidden_dim=hidden_dim,
+                           out_dim=out_dim, heads=2)
+
+    sage_params = sum(p.numel() for p in sage.parameters())
+    gatv2_params = sum(p.numel() for p in gatv2.parameters())
+
+    # GATv2 should have more params due to multi-head attention projections
+    assert gatv2_params > sage_params, \
+        f"GATv2 params ({gatv2_params}) should exceed GraphSAGE params ({sage_params})"
 
 
 # ---------------------------------------------------------------------------

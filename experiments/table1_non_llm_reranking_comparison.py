@@ -10,6 +10,7 @@ Methods compared:
     + PPR
     + GraphSAGE
     + R-GCN
+    + R-GCN Lite
     + R-GCN + Constraint Score
     Final Graph (Ours) — QFE-RGCN
     Fast Final Graph (Ours) — Lightweight Query-Adaptive Fusion
@@ -36,6 +37,7 @@ import hashlib
 import json
 import pickle
 import random
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -56,7 +58,7 @@ from feg_rag.graph.builder import build_financial_evidence_graph
 from feg_rag.graph.entities import EntityExtractor, extract_entities
 from feg_rag.graph.features import build_node_features
 from feg_rag.rerank.fusion import ConstraintScorer, FusionScorer
-from feg_rag.rerank.gnn import GNNFusionReranker, GraphSAGEReranker
+from feg_rag.rerank.gnn import GNNFusionReranker, GraphSAGEReranker, GATv2Reranker
 from feg_rag.rerank.ppr import ppr_rerank
 from feg_rag.rerank.qfe_rgcn import (
     QFERGCNFusionReranker,
@@ -72,7 +74,13 @@ from feg_rag.rerank.qfe_rgcn import (
     build_bge_query_embedding_cache,
 )
 from feg_rag.rerank.query_features import QUERY_FEATURE_DIM
-from feg_rag.rerank.rgcn import RGCNFusionReranker, RGCNReranker
+from feg_rag.rerank.rgcn import RGCNFusionReranker, RGCNReranker, LiteRGCNReranker
+from feg_rag.rerank.dcf_gnn import DCFGNNFusionReranker, DCFGNNReranker
+from feg_rag.rerank.c2_dcf_gnn import (
+    C2DCFFusionReranker,
+    C2DCFGNNReranker,
+    write_c2_diagnostics,
+)
 from feg_rag.rerank.train import (
     build_train_pairs,
     save_training_artifacts,
@@ -428,7 +436,11 @@ METHOD_FILES = {
     "cross_encoder": "cross_encoder_results.jsonl",
     "ppr": "ppr_results.jsonl",
     "graphsage": "graphsage_results.jsonl",
+    "gatv2": "gatv2_results.jsonl",
     "rgcn": "rgcn_results.jsonl",
+    "rgcn_lite": "rgcn_lite_results.jsonl",
+    "dcf_gnn": "dcf_gnn_results.jsonl",
+    "c2_dcf_gnn": "c2_dcf_gnn_results.jsonl",
     "rgcn_constraint": "rgcn_constraint_results.jsonl",
     "qfe_rgcn": "qfe_rgcn_results.jsonl",
     "qfe_rgcn_v2": "qfe_rgcn_v2_results.jsonl",
@@ -440,7 +452,7 @@ METHOD_FILES = {
 
 METHOD_ORDER = [
     "best_retriever", "cross_encoder", "ppr",
-    "graphsage", "rgcn", "rgcn_constraint", "qfe_rgcn", "qfe_rgcn_v2", "qfe_rgcn_ppr",
+    "graphsage", "gatv2", "rgcn", "rgcn_lite", "dcf_gnn", "c2_dcf_gnn", "rgcn_constraint", "qfe_rgcn", "qfe_rgcn_v2", "qfe_rgcn_ppr",
     "mono_t5", "list_t5", "fast_final_graph",
 ]
 
@@ -449,7 +461,11 @@ METHOD_LABELS = {
     "cross_encoder": "+ Cross-Encoder",
     "ppr": "+ PPR",
     "graphsage": "+ GraphSAGE",
+    "gatv2": "+ GATv2",
     "rgcn": "+ R-GCN",
+    "rgcn_lite": "R-GCN Lite",
+    "dcf_gnn": "DCF-GNN (Ours)",
+    "c2_dcf_gnn": "C2-DCF-GNN (Ours)",
     "rgcn_constraint": "+ R-GCN + Constraint Score",
     "qfe_rgcn": "Final Graph v1 (Ours)",
     "qfe_rgcn_v2": "Final Graph v2 (Ours)",
@@ -594,15 +610,25 @@ def run_gnn_reranker(
         except Exception:
             ids = candidate_ids[:output_k]
 
-        results.append(_make_result(s, ids, gold_map.get(s["id"], []), method_name))
+        result = _make_result(s, ids, gold_map.get(s["id"], []), method_name)
+        diagnostics = getattr(reranker, "last_diagnostics", None)
+        if diagnostics:
+            result["diagnostics"] = diagnostics
+        results.append(result)
         if progress_every > 0 and (idx % progress_every == 0 or idx == len(samples)):
             elapsed = time.time() - t_start
             rate = idx / max(elapsed, 1e-6)
             eta = (len(samples) - idx) / max(rate, 1e-6)
+            cache_suffix = ""
+            if hasattr(reranker, "eval_cache_hits") and hasattr(reranker, "eval_cache_misses"):
+                cache_suffix = (
+                    f" cache h/m={getattr(reranker, 'eval_cache_hits')}/"
+                    f"{getattr(reranker, 'eval_cache_misses')}"
+                )
             print(
                 f"    [{method_name}] eval {idx}/{len(samples)} "
                 f"({idx / max(len(samples), 1):.1%}) elapsed={elapsed:.1f}s "
-                f"eta={eta:.1f}s",
+                f"eta={eta:.1f}s{cache_suffix}",
                 flush=True,
             )
             if partial_path is not None:
@@ -1493,6 +1519,41 @@ def _checkpoint_method(
     print(f"    [checkpoint] Wrote partial outputs through '{method}'")
 
 
+def _write_dcf_diagnostics(output_dir: Path, results: List[Dict]) -> None:
+    """Write aggregate DCF-GNN diagnostics without changing metric outputs."""
+    diagnostics = [r.get("diagnostics") or {} for r in results]
+    diagnostics = [d for d in diagnostics if d]
+    if not diagnostics:
+        return
+
+    by_type: Dict[str, List[Dict]] = {}
+    for d in diagnostics:
+        by_type.setdefault(str(d.get("query_type", "unknown")), []).append(d)
+
+    def _mean(rows: List[Dict], key: str, default: float = 0.0) -> float:
+        vals = [float(r[key]) for r in rows if key in r]
+        return round(float(np.mean(vals)), 4) if vals else default
+
+    summary = {
+        "num_queries_with_diagnostics": len(diagnostics),
+        "channel_gate_by_query_type": {
+            qtype: {
+                "num_queries": len(rows),
+                "structural_gate_mean": _mean(rows, "structural_gate_mean"),
+                "semantic_gate_mean": _mean(rows, "semantic_gate_mean"),
+            }
+            for qtype, rows in sorted(by_type.items())
+        },
+        "semantic_conflict_downweight": {
+            "wrong_company": _mean(diagnostics, "semantic_downweight_wrong_company", 1.0),
+            "wrong_year": _mean(diagnostics, "semantic_downweight_wrong_year", 1.0),
+            "wrong_metric": _mean(diagnostics, "semantic_downweight_wrong_metric", 1.0),
+        },
+    }
+    with open(output_dir / "dcf_gnn_diagnostics.json", "w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2, ensure_ascii=False)
+
+
 def _load_graphsage_checkpoint(
     checkpoint_path: str | Path,
     *,
@@ -1503,6 +1564,42 @@ def _load_graphsage_checkpoint(
     model = GraphSAGEReranker(
         in_dim=base_feature_dim + QUERY_FEATURE_DIM,
         hidden_dim=cfg.rerank["gnn_hidden"],
+        dropout=cfg.rerank["gnn_dropout"],
+    )
+    return GNNFusionReranker.load(checkpoint_path, model=model, device=device)
+
+
+def _load_gatv2_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    base_feature_dim: int,
+    cfg: Config,
+    device: str,
+) -> GNNFusionReranker:
+    """Load a saved GATv2 checkpoint for eval-only runs.
+
+    Infers hidden_dim / out_dim / heads from the stored checkpoint so the
+    caller does not need to track exact hyperparameters — avoids shape mismatches
+    between training and eval-only loading.
+    """
+    import torch
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model_state = ckpt["model_state"]
+
+    # Infer architecture dims from checkpoint. conv1 output is the hidden
+    # representation, while conv2 output is the final GATv2 representation.
+    hidden_dim = model_state["conv1.lin_src.weight"].shape[0]
+    heads = model_state["conv1.att"].shape[0]
+    out_per_head = model_state["conv2.att"].shape[1]
+    hidden_per_head = hidden_dim // heads
+    out_dim = out_per_head * heads
+
+    model = GATv2Reranker(
+        in_dim=base_feature_dim + QUERY_FEATURE_DIM,
+        hidden_dim=hidden_per_head * heads,
+        out_dim=out_dim,
+        heads=heads,
         dropout=cfg.rerank["gnn_dropout"],
     )
     return GNNFusionReranker.load(checkpoint_path, model=model, device=device)
@@ -1529,9 +1626,99 @@ def _load_rgcn_checkpoint(
     return RGCNFusionReranker.load(checkpoint_path, model=model, device=device)
 
 
+def _load_rgcn_lite_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    base_feature_dim: int,
+    cfg: Config,
+    device: str,
+) -> RGCNFusionReranker:
+    """Load a saved R-GCN Lite checkpoint for eval-only runs.
+
+    Infers hidden_dim from the stored checkpoint so the caller does not need
+    to track the exact architecture hyperparameters.
+    """
+    import torch
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    relation_map = ckpt.get("relation_map", {})
+    num_relations = max(relation_map.values()) + 1 if relation_map else 1
+
+    # Infer hidden/out dims from checkpoint state dict
+    model_state = ckpt["model_state"]
+    hidden_dim = model_state["conv1.self_loop.weight"].shape[0]
+    out_dim = model_state["conv2.self_loop.weight"].shape[0]
+
+    model = LiteRGCNReranker(
+        in_dim=base_feature_dim + QUERY_FEATURE_DIM,
+        hidden_dim=hidden_dim,
+        out_dim=out_dim,
+        num_relations=num_relations,
+        dropout=cfg.rerank["gnn_dropout"],
+    )
+    reranker = RGCNFusionReranker.load(checkpoint_path, model=model, device=device)
+    if "alpha" not in ckpt:
+        reranker.alpha = cfg.rerank.get("rgcn_lite_fusion_alpha", 0.85)
+        reranker.beta = cfg.rerank.get("rgcn_lite_fusion_beta", 0.0)
+        reranker.gamma = cfg.rerank.get("rgcn_lite_fusion_gamma", 0.15)
+    return reranker
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # QFE-RGCN checkpoint loading & score cache helpers
 # ═════════════════════════════════════════════════════════════════════════════
+
+def _load_dcf_gnn_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    base_feature_dim: int,
+    cfg: Config,
+    device: str,
+) -> DCFGNNFusionReranker:
+    import torch
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    structural_relation_map = ckpt.get("structural_relation_map", {})
+    semantic_relation_map = ckpt.get("semantic_relation_map", {})
+    num_structural = max(structural_relation_map.values()) + 1 if structural_relation_map else 1
+    num_semantic = max(semantic_relation_map.values()) + 1 if semantic_relation_map else 1
+    model = DCFGNNReranker(
+        in_dim=base_feature_dim + QUERY_FEATURE_DIM,
+        hidden_dim=cfg.rerank["gnn_hidden"],
+        out_dim=cfg.rerank.get("gnn_out_dim", 64),
+        num_structural_relations=num_structural,
+        num_semantic_relations=num_semantic,
+        dropout=cfg.rerank["gnn_dropout"],
+    )
+    return DCFGNNFusionReranker.load(checkpoint_path, model=model, device=device)
+
+
+def _load_c2_dcf_gnn_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    base_feature_dim: int,
+    cfg: Config,
+    device: str,
+) -> C2DCFFusionReranker:
+    import torch
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    structural_relation_map = ckpt.get("structural_relation_map", {})
+    semantic_relation_map = ckpt.get("semantic_relation_map", {})
+    num_structural = max(structural_relation_map.values()) + 1 if structural_relation_map else 1
+    num_semantic = max(semantic_relation_map.values()) + 1 if semantic_relation_map else 1
+    model = C2DCFGNNReranker(
+        in_dim=base_feature_dim + QUERY_FEATURE_DIM,
+        hidden_dim=cfg.rerank["gnn_hidden"],
+        out_dim=cfg.rerank.get("gnn_out_dim", 64),
+        num_structural_relations=num_structural,
+        num_semantic_relations=num_semantic,
+        top_k=cfg.rerank.get("c2_top_k", 2),
+        tau=cfg.rerank.get("c2_tau", 0.15),
+        dropout=cfg.rerank["gnn_dropout"],
+    )
+    return C2DCFFusionReranker.load(checkpoint_path, model=model, device=device)
+
 
 def _compute_file_hash(file_path: Path) -> str:
     """Compute a stable hash of a file for cache identification.
@@ -1812,6 +1999,8 @@ def main() -> None:
                         help="Limit samples (0=all FinDER)")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override GNN training epochs")
+    parser.add_argument("--gnn_batch_size", type=int, default=32,
+                        help="Batch size for GNN training (try 128 or 256 on 24GB GPUs)")
     parser.add_argument("--device", default=_default_device(),
                         help="Device for GNN training (cuda/cpu)")
     parser.add_argument("--dense_device", default="cpu",
@@ -1826,7 +2015,7 @@ def main() -> None:
                         help="Train/val split ratio")
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--skip_gnn", action="store_true",
-                        help="Skip GNN training (GraphSAGE, R-GCN, R-GCN+Constraint)")
+                        help="Skip GNN training (GraphSAGE, R-GCN, DCF-GNN, R-GCN+Constraint)")
     parser.add_argument("--corpus_cache", default=None,
                         help="Pickle cache for full benchmark corpus/gold_map")
     parser.add_argument("--rebuild_corpus_cache", action="store_true",
@@ -1844,11 +2033,55 @@ def main() -> None:
     parser.add_argument("--candidate_pool_name", default="CandidatePool",
                         help="Display name for --candidate_results_jsonl")
     parser.add_argument("--methods", default="best_retriever,cross_encoder,ppr,graphsage,rgcn,rgcn_constraint",
-                        help="Comma-separated methods to run (available: best_retriever, cross_encoder, ppr, graphsage, rgcn, rgcn_constraint, qfe_rgcn, qfe_rgcn_v2, qfe_rgcn_ppr, mono_t5, list_t5, fast_final_graph)")
+                        help="Comma-separated methods to run (available: best_retriever, cross_encoder, ppr, graphsage, gatv2, rgcn, rgcn_lite, dcf_gnn, c2_dcf_gnn, rgcn_constraint, qfe_rgcn, qfe_rgcn_v2, qfe_rgcn_ppr, mono_t5, list_t5, fast_final_graph)")
     parser.add_argument("--load_graphsage_checkpoint", default=None,
                         help="Load a saved GraphSAGE checkpoint and evaluate without retraining")
+    parser.add_argument("--load_gatv2_checkpoint", default=None,
+                        help="Load a saved GATv2 checkpoint and evaluate without retraining")
     parser.add_argument("--load_rgcn_checkpoint", default=None,
                         help="Load a saved R-GCN checkpoint and evaluate without retraining")
+    parser.add_argument("--load_rgcn_lite_checkpoint", default=None,
+                        help="Load a saved R-GCN Lite checkpoint and evaluate without retraining")
+    parser.add_argument("--load_dcf_checkpoint", default=None,
+                        help="Load a saved DCF-GNN checkpoint and evaluate without retraining")
+    parser.add_argument("--load_c2_dcf_checkpoint", default=None,
+                        help="Load a saved C2-DCF-GNN checkpoint and evaluate without retraining")
+
+    # ---- R-GCN Lite ----
+    parser.add_argument("--rgcn_lite_hidden", type=int, default=96,
+                        help="Hidden dimension for R-GCN Lite")
+    parser.add_argument("--rgcn_lite_out_dim", type=int, default=48,
+                        help="Output dimension for R-GCN Lite")
+    parser.add_argument("--rgcn_lite_fusion_alpha", type=float, default=0.85,
+                        help="R-GCN Lite retrieval-score fusion weight")
+    parser.add_argument("--rgcn_lite_fusion_beta", type=float, default=0.0,
+                        help="R-GCN Lite optional graph/PPR fusion weight")
+    parser.add_argument("--rgcn_lite_fusion_gamma", type=float, default=0.15,
+                        help="R-GCN Lite GNN-score fusion weight")
+    # ---- GATv2 ----
+    parser.add_argument("--gatv2_hidden", type=int, default=96,
+                        help="Hidden dimension for GATv2 reranker")
+    parser.add_argument("--gatv2_out_dim", type=int, default=48,
+                        help="Output dimension for GATv2 reranker")
+    parser.add_argument("--gatv2_heads", type=int, default=4,
+                        help="Number of attention heads for GATv2")
+    parser.add_argument("--gatv2_fusion_alpha", type=float, default=0.70,
+                        help="GATv2 retrieval-score fusion weight")
+    parser.add_argument("--gatv2_fusion_beta", type=float, default=0.0,
+                        help="GATv2 optional graph/PPR fusion weight")
+    parser.add_argument("--gatv2_fusion_gamma", type=float, default=0.30,
+                        help="GATv2 GNN-score fusion weight")
+
+    # ---- C2-DCF-GNN ----
+    parser.add_argument("--c2_top_k", type=int, default=2,
+                        help="Top-k experts for C2-DCF-GNN sparse routing")
+    parser.add_argument("--c2_tau", type=float, default=0.15,
+                        help="Correction strength for C2-DCF-GNN score fusion")
+    parser.add_argument("--c2_route_contrastive_lambda", type=float, default=0.05,
+                        help="Contrastive routing loss weight for C2-DCF-GNN")
+    parser.add_argument("--c2_confidence_lambda", type=float, default=0.05,
+                        help="Confidence supervision loss weight for C2-DCF-GNN")
+
     parser.add_argument("--eval_only_checkpoint", action="store_true",
                         help="For GNN methods, require checkpoint loading and skip training")
     parser.add_argument("--sanity", action="store_true",
@@ -1861,6 +2094,10 @@ def main() -> None:
                         help="GraphSAGE/R-GCN: compute PPR auxiliary scores during evaluation (slow; default off)")
     parser.add_argument("--rerank_checkpoint_every", type=int, default=100,
                         help="Write reranker partial JSONL and print progress every N queries")
+    parser.add_argument("--gnn_eval_cache", default=None,
+                        help="Persistent eval tensor cache root for DCF/C2 GNN rerankers")
+    parser.add_argument("--rebuild_gnn_eval_cache", action="store_true",
+                        help="Delete --gnn_eval_cache before evaluation")
     parser.add_argument("--allow_rerank_fallback", action="store_true",
                         help="Allow fallback to candidate top-k when rerank raises an exception (debug only)")
 
@@ -1961,6 +2198,17 @@ def main() -> None:
 
     if args.epochs:
         cfg.rerank["gnn_epochs"] = args.epochs
+    cfg.rerank["rgcn_lite_hidden"] = args.rgcn_lite_hidden
+    cfg.rerank["rgcn_lite_out_dim"] = args.rgcn_lite_out_dim
+    cfg.rerank["rgcn_lite_fusion_alpha"] = args.rgcn_lite_fusion_alpha
+    cfg.rerank["rgcn_lite_fusion_beta"] = args.rgcn_lite_fusion_beta
+    cfg.rerank["rgcn_lite_fusion_gamma"] = args.rgcn_lite_fusion_gamma
+    cfg.rerank["gatv2_hidden"] = args.gatv2_hidden
+    cfg.rerank["gatv2_out_dim"] = args.gatv2_out_dim
+    cfg.rerank["gatv2_heads"] = args.gatv2_heads
+    cfg.rerank["gatv2_fusion_alpha"] = args.gatv2_fusion_alpha
+    cfg.rerank["gatv2_fusion_beta"] = args.gatv2_fusion_beta
+    cfg.rerank["gatv2_fusion_gamma"] = args.gatv2_fusion_gamma
     selected_methods = {
         m.strip() for m in args.methods.split(",") if m.strip()
     }
@@ -1968,6 +2216,13 @@ def main() -> None:
     output_dir = Path(args.output_dir or cfg.output_dir)
     if not output_dir.is_absolute():
         output_dir = cfg.root_dir / output_dir
+
+    gnn_eval_cache_root: Optional[Path] = None
+    if args.gnn_eval_cache:
+        gnn_eval_cache_root = _resolve_cache_path(args.gnn_eval_cache, cfg)
+        if args.rebuild_gnn_eval_cache and gnn_eval_cache_root.exists():
+            shutil.rmtree(gnn_eval_cache_root)
+        gnn_eval_cache_root.mkdir(parents=True, exist_ok=True)
 
     # Overwrite guard
     if _has_results(output_dir) and not args.overwrite_output_dir:
@@ -1992,6 +2247,7 @@ def main() -> None:
     print(f"  Corpus cache: {args.corpus_cache or 'disabled'}")
     print(f"  Graph cache:  {args.graph_cache or 'disabled'}")
     print(f"  Feature cache: {args.graph_feature_retriever_cache or 'disabled'}")
+    print(f"  GNN eval cache: {gnn_eval_cache_root or 'disabled'}")
     print(f"  Candidate pool: {args.candidate_pool_name if args.candidate_results_jsonl else 'Hybrid'}")
     print(f"  Methods:      {','.join(sorted(selected_methods))}")
 
@@ -2174,7 +2430,8 @@ def main() -> None:
                 sage_reranker, sage_history, sage_meta = train_gnn_reranker(
                     train_samples, candidate_retriever, graph, features, gold_map, cfg,
                     epochs=cfg.rerank.get("gnn_epochs", 10),
-                    device=device, min_pairs=5, verbose=True,
+                    device=device, min_pairs=5, batch_size=args.gnn_batch_size,
+                    verbose=True,
                 )
             if sage_reranker is not None:
                 if not args.load_graphsage_checkpoint:
@@ -2199,6 +2456,66 @@ def main() -> None:
             else:
                 print("    [SKIP] GraphSAGE training failed (not enough pairs)")
 
+        # Train GATv2
+        if "gatv2" in selected_methods:
+            t0 = time.time()
+            gatv2_history, gatv2_meta = [], {}
+            if args.load_gatv2_checkpoint:
+                print("\n  [gatv2] Loading GATv2 checkpoint...")
+                gatv2_reranker = _load_gatv2_checkpoint(
+                    args.load_gatv2_checkpoint,
+                    base_feature_dim=feature_dim,
+                    cfg=cfg,
+                    device=device,
+                )
+                print(f"    Loaded: {args.load_gatv2_checkpoint}")
+            else:
+                if args.eval_only_checkpoint:
+                    raise ValueError(
+                        "--eval_only_checkpoint requested but "
+                        "--load_gatv2_checkpoint was not provided"
+                    )
+                print("\n  [gatv2] Training GATv2 reranker...")
+                print(f"    Residual dense GATv2 attention: heads={cfg.rerank.get('gatv2_heads', 4)}, "
+                      f"hidden={cfg.rerank.get('gatv2_hidden', 96)}, "
+                      f"out_dim={cfg.rerank.get('gatv2_out_dim', 48)}")
+                print(f"    Strong baseline fusion: alpha={cfg.rerank.get('gatv2_fusion_alpha', 0.70)}, "
+                      f"beta={cfg.rerank.get('gatv2_fusion_beta', 0.0)}, "
+                      f"gamma={cfg.rerank.get('gatv2_fusion_gamma', 0.30)}")
+                print(f"    Forcing batch_size=1 for dense GATv2 attention")
+                cfg.rerank["gnn_model"] = "gatv2"
+                # Route GATv2-specific dims through the config so train_gnn_reranker sees them
+                cfg.rerank["gnn_hidden"] = cfg.rerank.get("gatv2_hidden", 96)
+                cfg.rerank["gnn_out_dim"] = cfg.rerank.get("gatv2_out_dim", 48)
+                gatv2_reranker, gatv2_history, gatv2_meta = train_gnn_reranker(
+                    train_samples, candidate_retriever, graph, features, gold_map, cfg,
+                    epochs=cfg.rerank.get("gnn_epochs", 10),
+                    device=device, min_pairs=5, batch_size=1,  # force batch_size=1
+                    verbose=True,
+                )
+            if gatv2_reranker is not None:
+                if not args.load_gatv2_checkpoint:
+                    save_training_artifacts(
+                        gatv2_reranker, gatv2_history, output_dir, gatv2_meta,
+                        experiment="table1_gatv2",
+                    )
+                    print(f"    Training done in {time.time() - t0:.1f}s")
+                print(f"    Evaluating GATv2 on {len(eval_samples)} samples...")
+                t_eval = time.time()
+                all_results["gatv2"] = run_gnn_reranker(
+                    eval_samples, candidate_retriever, graph, features, gold_map,
+                    chunk_by_id, extractor, gatv2_reranker, "gatv2",
+                    top_n=args.top_n, output_k=args.output_k,
+                    ppr_alpha=cfg.rerank.get("ppr_alpha", 0.85),
+                    use_ppr=args.gnn_use_ppr,
+                    progress_every=args.rerank_checkpoint_every,
+                    partial_output_dir=output_dir,
+                )
+                print(f"    Evaluation done in {time.time() - t_eval:.1f}s")
+                _checkpoint_method(output_dir, "gatv2", all_results, k_values)
+            else:
+                print("    [SKIP] GATv2 training failed (not enough pairs)")
+
         # Train R-GCN
         if "rgcn" in selected_methods or "rgcn_constraint" in selected_methods:
             t0 = time.time()
@@ -2222,7 +2539,8 @@ def main() -> None:
                 rgcn_reranker, rgcn_history, rgcn_meta = train_gnn_reranker(
                     train_samples, candidate_retriever, graph, features, gold_map, cfg,
                     epochs=cfg.rerank.get("gnn_epochs", 10),
-                    device=device, min_pairs=5, verbose=True,
+                    device=device, min_pairs=5, batch_size=args.gnn_batch_size,
+                    verbose=True,
                 )
             if rgcn_reranker is not None:
                 if not args.load_rgcn_checkpoint:
@@ -2267,6 +2585,183 @@ def main() -> None:
                     _checkpoint_method(output_dir, "rgcn_constraint", all_results, k_values)
             else:
                 print("    [SKIP] R-GCN training failed (not enough pairs)")
+
+        # Train R-GCN Lite
+        if "rgcn_lite" in selected_methods:
+            t0 = time.time()
+            if args.load_rgcn_lite_checkpoint:
+                print("\n  [rgcn_lite] Loading R-GCN Lite checkpoint...")
+                rgcn_lite_reranker = _load_rgcn_lite_checkpoint(
+                    args.load_rgcn_lite_checkpoint,
+                    base_feature_dim=feature_dim,
+                    cfg=cfg,
+                    device=device,
+                )
+                print(f"    Loaded: {args.load_rgcn_lite_checkpoint}")
+            else:
+                if args.eval_only_checkpoint:
+                    raise ValueError(
+                        "--eval_only_checkpoint requested but "
+                        "--load_rgcn_lite_checkpoint was not provided"
+                    )
+                print("\n  [rgcn_lite] Training R-GCN Lite reranker...")
+                print(f"    Design: shared transformation + per-relation scalar gates")
+                print(f"    Hidden dim: {cfg.rerank.get('rgcn_lite_hidden', 96)}  |  "
+                      f"Out dim: {cfg.rerank.get('rgcn_lite_out_dim', 48)}")
+                print(f"    Fusion: alpha={cfg.rerank.get('rgcn_lite_fusion_alpha', 0.85)}, "
+                      f"beta={cfg.rerank.get('rgcn_lite_fusion_beta', 0.0)}, "
+                      f"gamma={cfg.rerank.get('rgcn_lite_fusion_gamma', 0.15)}")
+                cfg.rerank["gnn_model"] = "rgcn_lite"
+                rgcn_lite_reranker, rgcn_lite_history, rgcn_lite_meta = train_gnn_reranker(
+                    train_samples, candidate_retriever, graph, features, gold_map, cfg,
+                    epochs=cfg.rerank.get("gnn_epochs", 10),
+                    device=device, min_pairs=5, batch_size=args.gnn_batch_size,
+                    verbose=True,
+                )
+            if rgcn_lite_reranker is not None:
+                if not args.load_rgcn_lite_checkpoint:
+                    save_training_artifacts(
+                        rgcn_lite_reranker, rgcn_lite_history, output_dir, rgcn_lite_meta,
+                        experiment="table1_rgcn_lite",
+                    )
+                    print(f"    Training done in {time.time() - t0:.1f}s")
+                print(f"    Evaluating R-GCN Lite on {len(eval_samples)} samples...")
+                t_eval = time.time()
+                all_results["rgcn_lite"] = run_gnn_reranker(
+                    eval_samples, candidate_retriever, graph, features, gold_map,
+                    chunk_by_id, extractor, rgcn_lite_reranker, "rgcn_lite",
+                    top_n=args.top_n, output_k=args.output_k,
+                    ppr_alpha=cfg.rerank.get("ppr_alpha", 0.85),
+                    use_ppr=args.gnn_use_ppr,
+                    progress_every=args.rerank_checkpoint_every,
+                    partial_output_dir=output_dir,
+                )
+                print(f"    Evaluation done in {time.time() - t_eval:.1f}s")
+                _checkpoint_method(output_dir, "rgcn_lite", all_results, k_values)
+            else:
+                print("    [SKIP] R-GCN Lite training failed (not enough pairs)")
+
+        # Train DCF-GNN
+        if "dcf_gnn" in selected_methods:
+            t0 = time.time()
+            if args.load_dcf_checkpoint:
+                print("\n  [dcf_gnn] Loading DCF-GNN checkpoint...")
+                dcf_reranker = _load_dcf_gnn_checkpoint(
+                    args.load_dcf_checkpoint,
+                    base_feature_dim=feature_dim,
+                    cfg=cfg,
+                    device=device,
+                )
+                print(f"    Loaded: {args.load_dcf_checkpoint}")
+            else:
+                if args.eval_only_checkpoint:
+                    raise ValueError(
+                        "--eval_only_checkpoint requested but "
+                        "--load_dcf_checkpoint was not provided"
+                    )
+                print("\n  [dcf_gnn] Training DCF-GNN reranker...")
+                print("    Structural channel: precise financial graph relations")
+                print("    Semantic channel: conflict-suppressed weak/similarity relations")
+                print("    Fusion: query-type-aware channel gate")
+                cfg.rerank["gnn_model"] = "dcf_gnn"
+                dcf_reranker, dcf_history, dcf_meta = train_gnn_reranker(
+                    train_samples, candidate_retriever, graph, features, gold_map, cfg,
+                    epochs=cfg.rerank.get("gnn_epochs", 10),
+                    device=device, min_pairs=5, batch_size=args.gnn_batch_size,
+                    verbose=True,
+                )
+            if dcf_reranker is not None:
+                if not args.load_dcf_checkpoint:
+                    save_training_artifacts(
+                        dcf_reranker, dcf_history, output_dir, dcf_meta,
+                        experiment="table1_dcf_gnn",
+                    )
+                    print(f"    Training done in {time.time() - t0:.1f}s")
+                print(f"    Evaluating DCF-GNN on {len(eval_samples)} samples...")
+                if gnn_eval_cache_root is not None and hasattr(dcf_reranker, "set_eval_cache"):
+                    cache_dir = gnn_eval_cache_root / "dcf_gnn"
+                    dcf_reranker.set_eval_cache(cache_dir)
+                    print(f"    [dcf_gnn] Eval tensor cache: {cache_dir}")
+                t_eval = time.time()
+                all_results["dcf_gnn"] = run_gnn_reranker(
+                    eval_samples, candidate_retriever, graph, features, gold_map,
+                    chunk_by_id, extractor, dcf_reranker, "dcf_gnn",
+                    top_n=args.top_n, output_k=args.output_k,
+                    ppr_alpha=cfg.rerank.get("ppr_alpha", 0.85),
+                    use_ppr=args.gnn_use_ppr,
+                    progress_every=args.rerank_checkpoint_every,
+                    partial_output_dir=output_dir,
+                )
+                print(f"    Evaluation done in {time.time() - t_eval:.1f}s")
+                _write_dcf_diagnostics(output_dir, all_results["dcf_gnn"])
+                _checkpoint_method(output_dir, "dcf_gnn", all_results, k_values)
+            else:
+                print("    [SKIP] DCF-GNN training failed (not enough pairs)")
+
+        # Train C2-DCF-GNN
+        if "c2_dcf_gnn" in selected_methods:
+            t0 = time.time()
+            if args.load_c2_dcf_checkpoint:
+                print("\n  [c2_dcf_gnn] Loading C2-DCF-GNN checkpoint...")
+                c2_reranker = _load_c2_dcf_gnn_checkpoint(
+                    args.load_c2_dcf_checkpoint,
+                    base_feature_dim=feature_dim,
+                    cfg=cfg,
+                    device=device,
+                )
+                print(f"    Loaded: {args.load_c2_dcf_checkpoint}")
+            else:
+                if args.eval_only_checkpoint:
+                    raise ValueError(
+                        "--eval_only_checkpoint requested but "
+                        "--load_c2_dcf_checkpoint was not provided"
+                    )
+                print("\n  [c2_dcf_gnn] Training C2-DCF-GNN reranker...")
+                print("    Experts: structural, semantic, conflict, retrieval")
+                print("    Router: query-type-aware with top-k sparse routing")
+                print("    Fusion: confidence-aware score-preserving correction")
+                cfg.rerank["gnn_model"] = "c2_dcf_gnn"
+                cfg.rerank["c2_top_k"] = args.c2_top_k
+                cfg.rerank["c2_tau"] = args.c2_tau
+                cfg.rerank["c2_route_contrastive_lambda"] = args.c2_route_contrastive_lambda
+                cfg.rerank["c2_confidence_lambda"] = args.c2_confidence_lambda
+                ckpt_dir = str(output_dir / "model_checkpoints")
+                c2_reranker, c2_history, c2_meta = train_gnn_reranker(
+                    train_samples, candidate_retriever, graph, features, gold_map, cfg,
+                    epochs=cfg.rerank.get("gnn_epochs", 10),
+                    device=device, min_pairs=5, batch_size=args.gnn_batch_size,
+                    verbose=True,
+                    checkpoint_dir=ckpt_dir,
+                    checkpoint_prefix="table1_c2_dcf_gnn",
+                    checkpoint_every=1,
+                )
+            if c2_reranker is not None:
+                if not args.load_c2_dcf_checkpoint:
+                    save_training_artifacts(
+                        c2_reranker, c2_history, output_dir, c2_meta,
+                        experiment="table1_c2_dcf_gnn",
+                    )
+                    print(f"    Training done in {time.time() - t0:.1f}s")
+                print(f"    Evaluating C2-DCF-GNN on {len(eval_samples)} samples...")
+                if gnn_eval_cache_root is not None and hasattr(c2_reranker, "set_eval_cache"):
+                    cache_dir = gnn_eval_cache_root / "c2_dcf_gnn"
+                    c2_reranker.set_eval_cache(cache_dir)
+                    print(f"    [c2_dcf_gnn] Eval tensor cache: {cache_dir}")
+                t_eval = time.time()
+                all_results["c2_dcf_gnn"] = run_gnn_reranker(
+                    eval_samples, candidate_retriever, graph, features, gold_map,
+                    chunk_by_id, extractor, c2_reranker, "c2_dcf_gnn",
+                    top_n=args.top_n, output_k=args.output_k,
+                    ppr_alpha=cfg.rerank.get("ppr_alpha", 0.85),
+                    use_ppr=args.gnn_use_ppr,
+                    progress_every=args.rerank_checkpoint_every,
+                    partial_output_dir=output_dir,
+                )
+                print(f"    Evaluation done in {time.time() - t_eval:.1f}s")
+                write_c2_diagnostics(output_dir, all_results["c2_dcf_gnn"])
+                _checkpoint_method(output_dir, "c2_dcf_gnn", all_results, k_values)
+            else:
+                print("    [SKIP] C2-DCF-GNN training failed (not enough pairs)")
 
         # Train / Load QFE-RGCN (covers both "qfe_rgcn" and "qfe_rgcn_ppr")
         if "qfe_rgcn" in selected_methods or "qfe_rgcn_ppr" in selected_methods:
@@ -2326,7 +2821,8 @@ def main() -> None:
                 qfe_reranker, qfe_history, qfe_meta = train_gnn_reranker(
                     train_samples, candidate_retriever, graph, features, gold_map, cfg,
                     epochs=cfg.rerank.get("gnn_epochs", 10),
-                    device=device, min_pairs=5, verbose=True,
+                    device=device, min_pairs=5, batch_size=args.gnn_batch_size,
+                    verbose=True,
                     query_embeddings=qfe_query_embeddings,
                 )
 
@@ -2478,7 +2974,8 @@ def main() -> None:
                 qfe_v2_reranker, qfe_v2_history, qfe_v2_meta = train_gnn_reranker(
                     train_samples, candidate_retriever, graph, features, gold_map, cfg,
                     epochs=cfg.rerank.get("gnn_epochs", 10),
-                    device=device, min_pairs=5, verbose=True,
+                    device=device, min_pairs=5, batch_size=args.gnn_batch_size,
+                    verbose=True,
                     query_embeddings=qfe_v2_query_embeddings,
                     negatives_per_positive=args.gnn_negatives_per_positive,
                     min_retrieval_weight=args.qfe_min_retrieval_weight,
@@ -2782,6 +3279,9 @@ def main() -> None:
         "ppr": "+ PPR                ",
         "graphsage": "+ GraphSAGE          ",
         "rgcn": "+ R-GCN              ",
+        "rgcn_lite": "R-GCN Lite           ",
+        "dcf_gnn": "DCF-GNN (Ours)       ",
+        "c2_dcf_gnn": "C2-DCF-GNN (Ours)    ",
         "rgcn_constraint": "+ R-GCN + Constraint ",
         "qfe_rgcn": "Final Graph v1 (Ours)",
         "qfe_rgcn_v2": "Final Graph v2 (Ours)",

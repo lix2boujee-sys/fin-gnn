@@ -912,6 +912,708 @@ class QFERGCNFusionReranker:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Retrieval-Preserved Fusion Head (v2)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class RetrievalPreservedFusionHead(nn.Module):
+    """Query-dependent weighted fusion that preserves the retrieval ranking prior.
+
+    final_score = w_ret(q) * ret_norm + w_gnn(q) * gnn_norm
+                + w_entity(q) * entity_match + w_delta(q) * delta_norm
+
+    Dynamic weights are produced from the query embedding by a small MLP,
+    softmax-normalised, then ``w_ret`` is floored to ``min_ret_weight``
+    and the excess is redistributed across the other three weights.
+    All score components are min-max normalised within the candidate set
+    before fusion.
+    """
+
+    def __init__(
+        self,
+        query_embed_dim: int = QUERY_EMBED_DIM,
+        hidden_dim: int = 64,
+        min_ret_weight: float = 0.35,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.min_ret_weight = min_ret_weight
+        self.weight_mlp = nn.Sequential(
+            nn.Linear(query_embed_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 4),  # w_ret, w_gnn, w_entity, w_delta
+        )
+
+    def forward(
+        self,
+        query_embed: torch.Tensor,
+        ret_scores: torch.Tensor,
+        gnn_scores: torch.Tensor,
+        entity_matches: torch.Tensor,
+        delta_scores: torch.Tensor,
+    ):
+        """Compute retrieval-preserved fused scores.
+
+        Args:
+            query_embed: ``(query_embed_dim,)`` or ``(B, query_embed_dim)``.
+            ret_scores: ``(N,)`` per-candidate retrieval scores.
+            gnn_scores: ``(N,)`` per-candidate GNN scores.
+            entity_matches: ``(N,)`` per-candidate entity match scores in [0,1].
+            delta_scores: ``(N,)`` per-candidate delta scores.
+
+        Returns:
+            ``(final_scores, (w_ret, w_gnn, w_entity, w_delta))`` where
+            *final_scores* has shape ``(N,)`` and each weight is a scalar.
+        """
+        if query_embed.dim() == 1:
+            query_embed = query_embed.unsqueeze(0)  # (1, query_embed_dim)
+
+        # Keep all candidate-level signals 1D. Some upstream scores arrive as
+        # (N, 1); leaving them that way broadcasts with (N,) into (N, N).
+        ret_scores = ret_scores.reshape(-1)
+        gnn_scores = gnn_scores.reshape(-1)
+        entity_matches = entity_matches.reshape(-1)
+        delta_scores = delta_scores.reshape(-1)
+
+        n = ret_scores.numel()
+        if not (
+            gnn_scores.numel() == n
+            and entity_matches.numel() == n
+            and delta_scores.numel() == n
+        ):
+            raise ValueError(
+                "RetrievalPreservedFusionHead signal length mismatch: "
+                f"ret={ret_scores.numel()}, gnn={gnn_scores.numel()}, "
+                f"entity={entity_matches.numel()}, delta={delta_scores.numel()}"
+            )
+
+        # Dynamic weights from query
+        raw_w = self.weight_mlp(query_embed)          # (1, 4)
+        weights = F.softmax(raw_w, dim=-1).squeeze(0)  # (4,)
+
+        # Floor retrieval weight, redistribute excess
+        w_ret = torch.clamp(weights[0], min=self.min_ret_weight)
+        excess = weights[0] - w_ret
+        other = weights[1:]
+        other_sum = other.sum()
+        if other_sum > 1e-8:
+            other = other + excess * (other / other_sum)
+        else:
+            other = other + excess / 3.0
+        w_gnn, w_entity, w_delta = other[0], other[1], other[2]
+
+        # Min-max normalise each component within candidates
+        def _minmax(scores: torch.Tensor) -> torch.Tensor:
+            s_min = scores.min()
+            s_max = scores.max()
+            denom = s_max - s_min
+            if denom > 1e-8:
+                return (scores - s_min) / denom
+            return torch.full_like(scores, 0.5)
+
+        ret_norm = _minmax(ret_scores)
+        gnn_norm = _minmax(gnn_scores)
+        delta_norm = _minmax(delta_scores)
+        # entity_matches are already in [0, 1]
+
+        final = (
+            w_ret * ret_norm
+            + w_gnn * gnn_norm
+            + w_entity * entity_matches
+            + w_delta * delta_norm
+        )
+        return final, (w_ret, w_gnn, w_entity, w_delta)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# QFE-RGCN v2: Retrieval-Preserved Fusion Reranker
+# ═════════════════════════════════════════════════════════════════════════════
+
+BGE_QUERY_EMBED_DIM = 1024
+
+
+def load_bge_model(
+    model_name: str = "BAAI/bge-m3",
+    device: str = "cpu",
+):
+    """Load a sentence-transformers BGE model.  Returns None on failure."""
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        return SentenceTransformer(model_name, device=device)
+    except ImportError:
+        return None
+
+
+def build_bge_query_embedding_cache(
+    queries: List[str],
+    model_name: str = "BAAI/bge-m3",
+    device: str = "cpu",
+    cache_path: Optional[str] = None,
+    fail_on_missing_model: bool = True,
+) -> Dict[str, np.ndarray]:
+    """Build or load a BGE-M3 query embedding cache with incremental updates.
+
+    If *cache_path* exists it is loaded via pickle, then only *missing_queries*
+    that are not already in the cache are encoded.  New embeddings are merged
+    and written back so that a cache populated during training (train queries)
+    can be extended with eval queries without re-encoding everything.
+
+    When *fail_on_missing_model* is ``True`` (default), a :exc:`RuntimeError`
+    is raised if the BGE model cannot be loaded — the caller is expected to
+    have already confirmed that ``query_encoder == "bge"``.  When ``False``,
+    falls back to :func:`derive_query_vector` for the missing queries only
+    (legacy behaviour).
+
+    Returns:
+        Dict mapping each unique query string → its L2-normalised embedding
+        (float32).
+    """
+    import pickle
+
+    # Deduplicate while preserving order
+    unique_queries = list(dict.fromkeys(queries))
+
+    # 1. Load existing cache if present
+    existing_cache: Dict[str, np.ndarray] = {}
+    if cache_path:
+        p = Path(cache_path)
+        if p.exists():
+            with open(p, "rb") as fh:
+                existing_cache = pickle.load(fh)
+
+    # 2. Find queries not yet cached
+    missing_queries = [q for q in unique_queries if q not in existing_cache]
+
+    # 3. All queries already cached → return early
+    if not missing_queries:
+        return existing_cache
+
+    # 4. Load BGE model — only needed for missing queries
+    bge_model = load_bge_model(model_name, device=device)
+    if bge_model is None:
+        if fail_on_missing_model:
+            raise RuntimeError(
+                "BGE query encoder requested but model unavailable. "
+                "Ensure sentence_transformers is installed and "
+                f"model '{model_name}' can be loaded."
+            )
+        # Legacy fallback to heuristic (only for missing_queries)
+        fallback = build_query_embedding_cache(missing_queries)
+        existing_cache.update(fallback)
+        if cache_path:
+            p = Path(cache_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "wb") as fh:
+                pickle.dump(existing_cache, fh)
+        return existing_cache
+
+    # 5. Encode only missing queries, then merge
+    embs = bge_model.encode(
+        missing_queries,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    )
+    for q, emb in zip(missing_queries, embs):
+        existing_cache[q] = np.asarray(emb, dtype=np.float32)
+
+    # 6. Persist updated cache
+    if cache_path:
+        p = Path(cache_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "wb") as fh:
+            pickle.dump(existing_cache, fh)
+
+    return existing_cache
+
+
+class QFERGCNFusionRerankerV2:
+    """QFE-RGCN v2: retrieval-preserved fusion reranker.
+
+    Key differences from v1 (:class:`QFERGCNFusionReranker`):
+
+    1. ``EntityGatedScoringHead`` produces **delta** scores, not final scores.
+    2. ``RetrievalPreservedFusionHead`` combines retrieval + GNN + entity match
+       + delta signals with query-dependent dynamic weights.
+    3. Retrieval weight is floored to ``min_retrieval_weight`` to preserve the
+       strong BGE ranking prior.
+    4. Supports BGE query embeddings with a learnable linear projection.
+    5. Delta regularisation penalises large delta deviations during training.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        scoring_head: EntityGatedScoringHead,
+        fusion_head: RetrievalPreservedFusionHead,
+        gnn_proj: nn.Module,
+        relation_map: Dict[str, int],
+        query_embeddings: Dict[str, np.ndarray],
+        query_embed_dim: int = QUERY_EMBED_DIM,
+        min_retrieval_weight: float = 0.35,
+        delta_reg: float = 0.05,
+        device: str = "cpu",
+        query_projection: Optional[nn.Module] = None,
+        query_encoder: str = "heuristic",
+        query_embedding_dim_raw: Optional[int] = None,
+    ):
+        self.model = model.to(device)
+        self.scoring_head = scoring_head.to(device)
+        self.fusion_head = fusion_head.to(device)
+        self.gnn_proj = gnn_proj.to(device)
+        self.relation_map = relation_map
+        self.num_relations = (
+            max(relation_map.values()) + 1 if relation_map else 1
+        )
+        self.query_embeddings = query_embeddings
+        self.query_embed_dim = query_embed_dim
+        self.min_retrieval_weight = min_retrieval_weight
+        self.delta_reg = delta_reg
+        self.device = device
+        self.query_encoder = query_encoder
+        self.query_projection = (
+            query_projection.to(device) if query_projection is not None else None
+        )
+        # Raw embedding dimension before projection (1024 for BGE, 64 for heuristic)
+        if query_embedding_dim_raw is None:
+            self.query_embedding_dim_raw = (
+                self.query_projection.in_features
+                if self.query_projection is not None else query_embed_dim
+            )
+        else:
+            self.query_embedding_dim_raw = query_embedding_dim_raw
+
+    # ------------------------------------------------------------------
+    # Train
+    # ------------------------------------------------------------------
+
+    def fit(
+        self,
+        train_dataset: QFERGCNRerankDataset,
+        val_dataset: Optional[QFERGCNRerankDataset] = None,
+        epochs: int = 50,
+        lr: float = 0.001,
+        batch_size: int = 32,
+        verbose: bool = True,
+    ) -> List[float]:
+        """Train with pairwise margin ranking loss on fused final scores."""
+        loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=_collate_qfe_rgcn,
+        )
+        params = (
+            list(self.model.parameters())
+            + list(self.scoring_head.parameters())
+            + list(self.fusion_head.parameters())
+            + list(self.gnn_proj.parameters())
+        )
+        if self.query_projection is not None:
+            params += list(self.query_projection.parameters())
+        optimizer = torch.optim.Adam(params, lr=lr)
+        loss_fn = nn.MarginRankingLoss(margin=0.5)
+
+        history: List[float] = []
+        self.model.train()
+        self.scoring_head.train()
+        self.fusion_head.train()
+        self.gnn_proj.train()
+        if self.query_projection is not None:
+            self.query_projection.train()
+
+        t_start = time.time()
+        n_batches = len(loader)
+        print(f"\n{'=' * 55}")
+        print(f"  Training QFE-RGCN v2 Reranker")
+        print(f"  Samples: {len(train_dataset)}  |  Epochs: {epochs}  |  "
+              f"Batches/epoch: {n_batches}")
+        print(f"  Relations: {self.num_relations}  |  "
+              f"Batch size: {batch_size}  |  Device: {self.device}  |  LR: {lr}")
+        print(f"  min_ret_weight: {self.min_retrieval_weight}  |  "
+              f"delta_reg: {self.delta_reg}")
+        print(f"{'=' * 55}")
+
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            epoch_t0 = time.time()
+            for batch in loader:
+                (
+                    x, adj_list, q_embed, pos_idx, neg_idx,
+                    ret_pos, ret_neg, match_pos, match_neg,
+                ) = batch
+
+                x = x.to(self.device)
+                adj_list = [a.to(self.device) for a in adj_list]
+                q_embed = q_embed.to(self.device)
+                pos_idx = pos_idx.to(self.device)
+                neg_idx = neg_idx.to(self.device)
+                ret_pos = ret_pos.to(self.device)
+                ret_neg = ret_neg.to(self.device)
+                match_pos = match_pos.to(self.device)
+                match_neg = match_neg.to(self.device)
+
+                # Apply learnable BGE projection if present
+                if self.query_projection is not None:
+                    q_embed = self.query_projection(q_embed)
+                    q_embed = F.normalize(q_embed, dim=-1)
+
+                # QFE-RGCN forward → per-node embeddings
+                gnn_embeds = self.model(x, adj_list, q_embed)
+                gnn_all = self.gnn_proj(gnn_embeds).squeeze(-1)  # (total_N,)
+
+                base_dim = self.scoring_head.chunk_proj[0].in_features
+                base_feats = x[:, :base_dim]
+
+                # --- delta scores via EntityGatedScoringHead ---
+                pos_delta = self.scoring_head(
+                    ret_pos, q_embed, base_feats[pos_idx], gnn_embeds[pos_idx],
+                    match_pos[:, 0], match_pos[:, 1], match_pos[:, 2],
+                    match_pos[:, 3], match_pos[:, 4],
+                )
+                neg_delta = self.scoring_head(
+                    ret_neg, q_embed, base_feats[neg_idx], gnn_embeds[neg_idx],
+                    match_neg[:, 0], match_neg[:, 1], match_neg[:, 2],
+                    match_neg[:, 3], match_neg[:, 4],
+                )
+
+                # --- per-candidate signals ---
+                pos_gnn = gnn_all[pos_idx]
+                neg_gnn = gnn_all[neg_idx]
+                pos_entity = match_pos.mean(dim=1)   # (B,)  average of 5 binaries
+                neg_entity = match_neg.mean(dim=1)
+
+                # --- fusion: pass pos + neg together for within-pair norm ---
+                ret_pair = torch.stack([ret_pos, ret_neg])            # (2,)
+                gnn_pair = torch.stack([pos_gnn, neg_gnn])            # (2,)
+                ent_pair = torch.stack([pos_entity, neg_entity])      # (2,)
+                del_pair = torch.stack([pos_delta, neg_delta])        # (2,)
+
+                pair_final, _ = self.fusion_head(
+                    q_embed, ret_pair, gnn_pair, ent_pair, del_pair,
+                )
+                pair_final = pair_final.reshape(-1)
+                pos_final = pair_final[0]
+                neg_final = pair_final[1]
+
+                # pairwise ranking loss
+                target = torch.ones_like(pos_final)
+                rank_loss = loss_fn(pos_final, neg_final, target)
+
+                # delta regularisation
+                delta_penalty = self.delta_reg * (
+                    torch.abs(pos_delta).mean() + torch.abs(neg_delta).mean()
+                )
+
+                loss = rank_loss + delta_penalty
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+
+            avg_loss = epoch_loss / max(n_batches, 1)
+            history.append(avg_loss)
+
+            pct_done = (epoch + 1) / epochs
+            bar_len = 20
+            filled = int(pct_done * bar_len)
+            bar = "#" * filled + "-" * (bar_len - filled)
+
+            delta_str = ""
+            if epoch > 0:
+                delta = avg_loss - history[epoch - 1]
+                sign = "v" if delta < 0 else "^"
+                delta_str = f"  d={sign}{abs(delta):.4f}"
+
+            elapsed = time.time() - t_start
+            epoch_time = time.time() - epoch_t0
+            eta = (
+                elapsed / (epoch + 1) * (epochs - epoch - 1)
+                if epoch + 1 < epochs else 0
+            )
+
+            if verbose:
+                print(
+                    f"  [{bar}] {pct_done:3.0%}  |  "
+                    f"Epoch {epoch + 1:>3}/{epochs}  |  "
+                    f"loss={avg_loss:.4f}{delta_str}"
+                    f"  |  {epoch_time:.1f}s/ep  |  "
+                    f"elapsed={elapsed:.0f}s  |  eta={eta:.0f}s"
+                )
+
+        total_time = time.time() - t_start
+        print(f"{'-' * 55}")
+        print(f"  Training finished in {total_time:.1f}s")
+        if len(history) >= 2:
+            print(
+                f"  Initial loss: {history[0]:.4f}  -->  "
+                f"Final loss: {history[-1]:.4f}"
+                f"  (d: {history[-1] - history[0]:+.4f})"
+            )
+        print(f"{'=' * 55}\n")
+        return history
+
+    # ------------------------------------------------------------------
+    # Rerank
+    # ------------------------------------------------------------------
+
+    def rerank(
+        self,
+        query: str,
+        candidate_chunks: List[Tuple[Chunk, float]],
+        graph: FinancialEvidenceGraph,
+        features: Dict[str, np.ndarray],
+        ppr_scores: Optional[Dict[str, float]] = None,
+    ) -> List[Tuple[Chunk, float]]:
+        """Rerank candidates with retrieval-preserved fusion."""
+        self.model.eval()
+        self.scoring_head.eval()
+        self.fusion_head.eval()
+        self.gnn_proj.eval()
+        if self.query_projection is not None:
+            self.query_projection.eval()
+
+        candidate_ids = [c.chunk_id for c, _ in candidate_chunks]
+        sub_nodes = set(candidate_ids)
+        for cid in candidate_ids:
+            sub_nodes |= graph.get_chunk_neighbors(cid, max_hops=1)
+
+        node_list = list(sub_nodes)
+        node2idx = {n: i for i, n in enumerate(node_list)}
+        N = len(node_list)
+
+        chunk_lookup = _build_qfe_chunk_lookup(graph)
+        for chunk, _ in candidate_chunks:
+            chunk_lookup[chunk.chunk_id] = chunk
+
+        retrieval_scores = {c.chunk_id: s for c, s in candidate_chunks}
+
+        # Base feature matrix
+        base_dim = next(iter(features.values())).shape[0]
+        x_base = np.zeros((N, base_dim), dtype=np.float32)
+        for n in node_list:
+            if n in features:
+                x_base[node2idx[n]] = features[n]
+
+        x_aug = build_query_augmented_features(
+            features, node_list, query,
+            chunk_lookup=chunk_lookup,
+            retrieval_scores=retrieval_scores,
+            graph_scores=ppr_scores or {},
+        )
+        x = np.concatenate([x_base, x_aug], axis=1)
+
+        # Per-relation adjacency
+        adj_list_np = [
+            np.zeros((N, N), dtype=np.float32)
+            for _ in range(self.num_relations)
+        ]
+        for u, v, k, etype in graph.graph.edges(keys=True, data="edge_type"):
+            if u not in node2idx or v not in node2idx:
+                continue
+            r = self.relation_map.get(etype)
+            if r is None:
+                continue
+            i, j = node2idx[u], node2idx[v]
+            adj_list_np[r][i, j] = 1.0
+            adj_list_np[r][j, i] = 1.0
+        for r in range(self.num_relations):
+            a = adj_list_np[r]
+            deg = a.sum(axis=1) + 1e-8
+            d_inv_sqrt = np.diag(1.0 / np.sqrt(deg))
+            adj_list_np[r] = d_inv_sqrt @ a @ d_inv_sqrt
+
+        # Query embedding — must match the encoder used at training time
+        if self.query_projection is not None:
+            if query not in self.query_embeddings:
+                raise ValueError(
+                    f"Query '{query[:80]}...' not found in query_embeddings. "
+                    f"BGE query_projection is active (query_encoder="
+                    f"{self.query_encoder}); all eval queries must be "
+                    f"pre-encoded via build_bge_query_embedding_cache()."
+                )
+            q_embed_np = self.query_embeddings[query]
+        else:
+            q_embed_np = self.query_embeddings.get(
+                query,
+                derive_query_vector(query, dim=self.query_embed_dim),
+            )
+
+        with torch.no_grad():
+            x_t = torch.from_numpy(x).to(self.device)
+            adj_list_t = [torch.from_numpy(a).to(self.device)
+                          for a in adj_list_np]
+            q_embed_t = torch.from_numpy(q_embed_np).to(self.device)
+
+            # Defensive dimension validation
+            if self.query_projection is not None:
+                expected_dim = self.query_projection.in_features
+                if q_embed_t.shape[-1] != expected_dim:
+                    raise ValueError(
+                        f"Query embedding dimension mismatch in rerank(): "
+                        f"got {q_embed_t.shape[-1]}, "
+                        f"expected {expected_dim} "
+                        f"(query_projection.in_features for "
+                        f"query_encoder={self.query_encoder})."
+                    )
+                q_embed_t = self.query_projection(q_embed_t)
+                q_embed_t = F.normalize(q_embed_t, dim=-1)
+            else:
+                if q_embed_t.shape[-1] != self.query_embed_dim:
+                    raise ValueError(
+                        f"Query embedding dimension mismatch in rerank(): "
+                        f"got {q_embed_t.shape[-1]}, "
+                        f"expected {self.query_embed_dim}."
+                    )
+
+            gnn_embeds = self.model(x_t, adj_list_t, q_embed_t)
+            gnn_all = self.gnn_proj(gnn_embeds).squeeze(-1)  # (N,)
+
+            base_feats_t = x_t[:, :base_dim]
+            base_dim_scoring = self.scoring_head.chunk_proj[0].in_features
+            base_feats_for_scoring = base_feats_t[:, :base_dim_scoring]
+
+            # Collect per-candidate signals
+            ret_list: List[torch.Tensor] = []
+            gnn_list: List[torch.Tensor] = []
+            ent_list: List[torch.Tensor] = []
+            del_list: List[torch.Tensor] = []
+
+            for chunk, _ in candidate_chunks:
+                cid = chunk.chunk_id
+                if cid not in node2idx:
+                    ret_list.append(torch.tensor(0.0, device=self.device))
+                    gnn_list.append(torch.tensor(0.0, device=self.device))
+                    ent_list.append(torch.tensor(0.0, device=self.device))
+                    del_list.append(torch.tensor(0.0, device=self.device))
+                    continue
+
+                idx = node2idx[cid]
+                ret_s = torch.tensor(
+                    retrieval_scores.get(cid, 0.0),
+                    dtype=torch.float32, device=self.device,
+                )
+                gnn_s = gnn_all[idx]
+                chunk_base = base_feats_for_scoring[idx:idx + 1]
+                gnn_emb = gnn_embeds[idx:idx + 1]
+
+                matches = _compute_entity_matches(cid, query, chunk_lookup)
+                match_t = torch.tensor(
+                    matches, dtype=torch.float32, device=self.device,
+                )
+                entity_s = match_t.mean()
+
+                delta = self.scoring_head(
+                    ret_s, q_embed_t, chunk_base, gnn_emb,
+                    match_t[0:1], match_t[1:2], match_t[2:3],
+                    match_t[3:4], match_t[4:5],
+                )
+
+                ret_list.append(ret_s)
+                gnn_list.append(gnn_s)
+                ent_list.append(entity_s)
+                del_list.append(delta)
+
+            ret_t = torch.stack(ret_list)
+            gnn_t = torch.stack(gnn_list)
+            ent_t = torch.stack(ent_list)
+            del_t = torch.stack(del_list)
+
+            final_scores, _ = self.fusion_head(
+                q_embed_t, ret_t, gnn_t, ent_t, del_t,
+            )
+            raw_shape = tuple(final_scores.shape)
+            final_scores = final_scores.detach().cpu().reshape(-1).numpy()
+
+        if len(final_scores) != len(candidate_chunks):
+            raise ValueError(
+                f"QFE v2 final_scores length mismatch: "
+                f"{len(final_scores)} scores for {len(candidate_chunks)} candidates; "
+                f"raw shape was {raw_shape}"
+            )
+
+        reranked = [
+            (chunk, float(final_scores[i]))
+            for i, (chunk, _) in enumerate(candidate_chunks)
+        ]
+        reranked.sort(key=lambda x: x[1], reverse=True)
+        return reranked
+
+    # ------------------------------------------------------------------
+    # I/O
+    # ------------------------------------------------------------------
+
+    def save(self, path: str | Path) -> None:
+        payload = {
+            "version": 2,
+            "model_state": self.model.state_dict(),
+            "scoring_head_state": self.scoring_head.state_dict(),
+            "fusion_head_state": self.fusion_head.state_dict(),
+            "gnn_proj_state": self.gnn_proj.state_dict(),
+            "relation_map": self.relation_map,
+            "query_embed_dim": self.query_embed_dim,
+            "query_encoder": self.query_encoder,
+            "query_embedding_dim_raw": self.query_embedding_dim_raw,
+            "min_retrieval_weight": self.min_retrieval_weight,
+        }
+        if self.query_projection is not None:
+            payload["query_projection_state"] = (
+                self.query_projection.state_dict()
+            )
+        torch.save(payload, path)
+
+    @classmethod
+    def load(
+        cls,
+        path: str | Path,
+        model: nn.Module,
+        scoring_head: EntityGatedScoringHead,
+        fusion_head: RetrievalPreservedFusionHead,
+        gnn_proj: nn.Module,
+        query_embeddings: Dict[str, np.ndarray],
+        device: str = "cpu",
+        query_projection: Optional[nn.Module] = None,
+    ) -> "QFERGCNFusionRerankerV2":
+        ckpt = torch.load(path, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        scoring_head.load_state_dict(ckpt["scoring_head_state"])
+        fusion_head.load_state_dict(ckpt["fusion_head_state"])
+        gnn_proj.load_state_dict(ckpt["gnn_proj_state"])
+        if (query_projection is not None
+                and "query_projection_state" in ckpt):
+            query_projection.load_state_dict(
+                ckpt["query_projection_state"]
+            )
+        query_encoder = ckpt.get("query_encoder", "heuristic")
+        raw_dim = ckpt.get("query_embedding_dim_raw", ckpt.get("query_embed_dim", QUERY_EMBED_DIM))
+        proj_dim = ckpt.get("query_embed_dim", QUERY_EMBED_DIM)
+        has_proj = "query_projection_state" in ckpt
+        print(
+            f"    [qfe_rgcn_v2] Checkpoint v{ckpt.get('version', '?')}  |  "
+            f"query_encoder: {query_encoder}  |  "
+            f"raw_dim: {raw_dim}  |  proj_dim: {proj_dim}  |  "
+            f"query_projection: {'yes' if has_proj else 'no'}"
+        )
+        return cls(
+            model=model,
+            scoring_head=scoring_head,
+            fusion_head=fusion_head,
+            gnn_proj=gnn_proj,
+            relation_map=ckpt.get("relation_map", {}),
+            query_embeddings=query_embeddings,
+            query_embed_dim=proj_dim,
+            min_retrieval_weight=ckpt.get("min_retrieval_weight", 0.35),
+            delta_reg=0.05,
+            device=device,
+            query_projection=query_projection,
+            query_encoder=query_encoder,
+            query_embedding_dim_raw=raw_dim,
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Collate helper for batched QFE-RGCN
 # ═════════════════════════════════════════════════════════════════════════════
 

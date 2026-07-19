@@ -156,6 +156,158 @@ class RGCNReranker(nn.Module):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# R-GCN Lite (shared-weight + scalar-gate, compute-friendly baseline)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class LiteRGCNLayer(nn.Module):
+    """Lightweight R-GCN layer with shared transformation + per-relation scalar gates.
+
+    Instead of one weight matrix per relation (vanilla R-GCN):
+
+        h' = W_self h + sum_r A_r W_r h
+
+    Lite uses a single shared weight plus a learnable scalar gate per relation:
+
+        h' = W_self h + sum_r g_r * A_r W_shared h
+
+    This cuts parameters from O(num_relations * in_dim * out_dim) down to
+    O(in_dim * out_dim + num_relations), making training and inference
+    substantially faster while preserving multi-relational modelling capacity.
+
+    Notes:
+        * Adjacency matrices in ``adj_list`` are expected to be
+          **pre-normalised** (e.g. D^-0.5 A D^-0.5) by the caller.
+        * ``norm_list`` is accepted for API compatibility but is **not used**
+          internally.
+        * ``use_bias`` controls an optional bias term; the per-relation gates
+          ``g_r`` are always present.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        num_relations: int,
+        dropout: float = 0.3,
+        use_bias: bool = True,
+        use_relation_bias: bool = False,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.num_relations = num_relations
+
+        # Self-loop weight (W_0) — kept separate for stability
+        self.self_loop = nn.Linear(in_dim, out_dim, bias=False)
+
+        # Shared transformation applied to all relations
+        self.shared = nn.Linear(in_dim, out_dim, bias=False)
+
+        # Per-relation learnable scalar gates
+        self.gates = nn.Parameter(torch.ones(num_relations))
+
+        # Optional per-relation bias (kept small to limit parameter growth)
+        self.relation_bias = (
+            nn.Parameter(torch.zeros(num_relations, out_dim))
+            if use_relation_bias
+            else None
+        )
+
+        self.dropout = nn.Dropout(dropout)
+        self.bias = nn.Parameter(torch.zeros(out_dim)) if use_bias else None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj_list: List[torch.Tensor],  # [num_relations * (N, N)] — pre-normalised
+        norm_list: List[torch.Tensor],  # [num_relations * (N,)] — accepted but NOT used
+    ) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Node features (N, in_dim).
+            adj_list: List of **pre-normalised** adjacency matrices, one per
+                relation type, each (N, N).
+            norm_list: Per-node normalisation scalars per relation.
+                **Accepted for API compatibility but not used**.
+
+        Returns:
+            Updated node features (N, out_dim).
+        """
+        out = self.self_loop(x)  # self-loop contribution
+        shared_support = self.shared(x)  # (N, out_dim) — computed once
+
+        for r in range(self.num_relations):
+            if adj_list[r].numel() == 0:
+                continue
+            # g_r * A_r @ W_shared h
+            gate = self.gates[r]
+            messages = gate * (adj_list[r] @ shared_support)  # (N, out_dim)
+            if self.relation_bias is not None:
+                messages = messages + self.relation_bias[r]
+            out = out + messages
+
+        out = F.relu(out)
+        out = self.dropout(out)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+
+class LiteRGCNReranker(nn.Module):
+    """2-layer Lite R-GCN for binary chunk relevance classification.
+
+    A lightweight variant of :class:`RGCNReranker` that uses
+    :class:`LiteRGCNLayer` (shared transformation + scalar gates) instead of
+    per-relation weight matrices.  Designed as a compute-friendly efficiency
+    baseline that keeps the same evaluation protocol as vanilla R-GCN.
+
+    Default hidden/out dims are smaller than vanilla R-GCN (96/48 vs 128/64)
+    to keep the model lean.  Both are configurable via the constructor.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 96,
+        out_dim: int = 48,
+        num_relations: int = 8,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.conv1 = LiteRGCNLayer(in_dim, hidden_dim, num_relations, dropout)
+        self.conv2 = LiteRGCNLayer(hidden_dim, out_dim, num_relations, dropout)
+        self.classifier = nn.Linear(out_dim, 1)
+
+        # Store for introspection
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj_list: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """Two-layer message passing.
+
+        Args:
+            x: Node features (N, in_dim).
+            adj_list: List of **pre-normalised** adjacency matrices per
+                relation type.
+
+        Returns:
+            Per-node scores (N, 1).
+        """
+        norm_list = [torch.ones(a.shape[0], device=x.device) if a.numel() > 0
+                     else torch.tensor([], device=x.device) for a in adj_list]
+
+        x = self.conv1(x, adj_list, norm_list)
+        x = self.conv2(x, adj_list, norm_list)
+        return self.classifier(x)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Dataset for R-GCN training
 # ═════════════════════════════════════════════════════════════════════════════
 

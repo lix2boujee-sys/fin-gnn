@@ -141,6 +141,25 @@ DEFAULTS: Dict[str, Any] = {
         "use_hard_negative_loss": True,
         "debug_examples": 10,
     },
+    # ---- FinMUSE evidence-set reranking ----
+    "finmuse": {
+        "enabled": True,
+        "max_set_size": 5,
+        "seed_top_k": 10,
+        "companion_pool_k": 50,
+        "min_reliability": 0.15,
+        "semantic_min_overlap": 1,
+        "use_learnable_scorer": False,
+        "debug_examples": 10,
+        "weights": {
+            "relevance": 0.50,
+            "coverage": 0.25,
+            "coherence": 0.15,
+            "redundancy": 0.05,
+            "conflict": 0.25,
+            "size": 0.02,
+        },
+    },
     # ---- generation ----
     "generation": {
         "model": "gpt-4o",

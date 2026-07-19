@@ -79,6 +79,111 @@ class GraphSAGEReranker(nn.Module):
         return self.classifier(x)
 
 
+class DenseGATv2Layer(nn.Module):
+    """Dense GATv2-style attention layer for small query subgraphs.
+
+    This avoids a torch-geometric dependency while keeping the key GATv2 idea:
+    attention depends on a non-linear combination of source and target node
+    projections. The implementation is chunked over source rows to avoid
+    constructing an enormous N x N x heads x dim tensor at once.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        heads: int = 4,
+        dropout: float = 0.3,
+        concat: bool = True,
+        row_chunk_size: int = 256,
+    ):
+        super().__init__()
+        self.out_dim = out_dim
+        self.heads = heads
+        self.concat = concat
+        self.row_chunk_size = row_chunk_size
+        self.lin_src = nn.Linear(in_dim, heads * out_dim, bias=False)
+        self.lin_dst = nn.Linear(in_dim, heads * out_dim, bias=False)
+        self.att = nn.Parameter(torch.empty(heads, out_dim))
+        self.bias = nn.Parameter(torch.zeros(heads * out_dim if concat else out_dim))
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(dropout)
+        nn.init.xavier_uniform_(self.lin_src.weight)
+        nn.init.xavier_uniform_(self.lin_dst.weight)
+        nn.init.xavier_uniform_(self.att)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        n_nodes = x.shape[0]
+        src = self.lin_src(x).view(n_nodes, self.heads, self.out_dim)
+        dst = self.lin_dst(x).view(n_nodes, self.heads, self.out_dim)
+        mask = adj > 0
+
+        outputs = []
+        for start in range(0, n_nodes, self.row_chunk_size):
+            end = min(start + self.row_chunk_size, n_nodes)
+            pair = self.leaky_relu(src[start:end, None, :, :] + dst[None, :, :, :])
+            logits = torch.einsum("bnhd,hd->bnh", pair, self.att)
+            logits = logits.masked_fill(~mask[start:end, :, None], torch.finfo(logits.dtype).min)
+            alpha = torch.softmax(logits, dim=1)
+            alpha = self.dropout(alpha)
+            out = torch.einsum("bnh,nhd->bhd", alpha, dst)
+            outputs.append(out)
+
+        h = torch.cat(outputs, dim=0)
+        if self.concat:
+            h = h.reshape(n_nodes, self.heads * self.out_dim)
+        else:
+            h = h.mean(dim=1)
+        return h + self.bias
+
+
+class GATv2Reranker(nn.Module):
+    """2-layer dense GATv2 baseline for evidence reranking.
+
+    The residual projections keep each candidate passage's own retrieval/entity
+    features available after attention aggregation.  This makes GATv2 a stronger
+    baseline than a pure neighbourhood smoother while still remaining a generic
+    untyped graph-attention model.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 64,
+        out_dim: int = 32,
+        heads: int = 4,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        hidden_per_head = max(1, hidden_dim // heads)
+        out_per_head = max(1, out_dim // heads)
+        self.conv1 = DenseGATv2Layer(
+            in_dim, hidden_per_head, heads=heads, dropout=dropout, concat=True
+        )
+        self.conv2 = DenseGATv2Layer(
+            hidden_per_head * heads, out_per_head, heads=heads, dropout=dropout, concat=True
+        )
+        self.res1 = nn.Linear(in_dim, hidden_per_head * heads, bias=False)
+        self.res2 = nn.Linear(hidden_per_head * heads, out_per_head * heads, bias=False)
+        self.norm1 = nn.LayerNorm(hidden_per_head * heads)
+        self.norm2 = nn.LayerNorm(out_per_head * heads)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(out_per_head * heads, 1)
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_per_head * heads
+        self.out_dim = out_per_head * heads
+        self.heads = heads
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(x, adj) + self.res1(x)
+        x = self.norm1(F.elu(h))
+        x = self.dropout(x)
+        h = self.conv2(x, adj) + self.res2(x)
+        x = self.norm2(F.elu(h))
+        x = self.dropout(x)
+        return self.classifier(x)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Dataset
 # ═════════════════════════════════════════════════════════════════════════════

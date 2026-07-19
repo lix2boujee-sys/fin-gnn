@@ -1,4 +1,4 @@
-"""Typed financial evidence path extraction and encoding.
+﻿"""Typed financial evidence path extraction and encoding.
 
 FinPath-RGCN keeps the vanilla R-GCN backbone unchanged and adds a separate
 path-aware branch.  This module contains the graph-side path extractor plus
@@ -180,7 +180,8 @@ def expand_years_from_text(text: str) -> set[str]:
 
     text = str(text or "")
     years = {m.group(0) for m in re.finditer(r"\b(?:19|20)\d{2}\b", text)}
-    for m in re.finditer(r"\b((?:19|20)\d{2})\s*(?:-|to|through|–|—)\s*(\d{2}|(?:19|20)\d{2})\b", text, re.I):
+    range_re = r"\b((?:19|20)\d{2})\s*(?:-|to|through)\s*(\d{2}|(?:19|20)\d{2})\b"
+    for m in re.finditer(range_re, text, re.I):
         start = int(m.group(1))
         end_raw = m.group(2)
         end = int(end_raw) if len(end_raw) == 4 else int(str(start)[:2] + end_raw)
@@ -738,3 +739,4 @@ class PathAggregator(nn.Module):
             "max_attention_index": max_idx,
             "max_attention_path_type": max_type,
         }
+

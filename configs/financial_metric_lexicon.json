@@ -1,0 +1,215 @@
+{
+  "_description": "Financial metric lexicon for query/passage entity extraction. Maps surface forms to canonical metric names. Used by finance_error_analysis.py to detect wrong-metric evidence errors.",
+
+  "metric_groups": {
+    "revenue": {
+      "canonical": "revenue",
+      "patterns": [
+        "revenue", "revenues", "total revenue", "total revenues",
+        "net revenue", "net revenues", "net sales", "sales",
+        "total net revenue", "total net sales",
+        "subscription revenue", "service revenue", "product revenue",
+        "license revenue", "data & access solutions revenue",
+        "transaction revenue", "market data revenue"
+      ]
+    },
+    "net_income": {
+      "canonical": "net_income",
+      "patterns": [
+        "net income", "net earnings", "net loss", "net profit",
+        "net income (loss)", "net income attributable",
+        "consolidated net income", "net income available",
+        "comprehensive income", "total comprehensive income"
+      ]
+    },
+    "operating_income": {
+      "canonical": "operating_income",
+      "patterns": [
+        "operating income", "operating earnings", "operating loss",
+        "income from operations", "operating profit",
+        "operating income (loss)", "operating margin"
+      ]
+    },
+    "gross_profit": {
+      "canonical": "gross_profit",
+      "patterns": [
+        "gross profit", "gross margin", "gross profit margin",
+        "gross loss"
+      ]
+    },
+    "eps": {
+      "canonical": "eps",
+      "patterns": [
+        "eps", "earnings per share", "diluted eps",
+        "diluted earnings per share", "basic eps",
+        "basic earnings per share", "earnings per diluted share",
+        "diluted net income per share"
+      ]
+    },
+    "ebitda": {
+      "canonical": "ebitda",
+      "patterns": [
+        "ebitda", "adjusted ebitda", "ebit",
+        "earnings before interest and taxes",
+        "earnings before interest, taxes, depreciation and amortization"
+      ]
+    },
+    "total_assets": {
+      "canonical": "total_assets",
+      "patterns": [
+        "total assets", "total liabilities and equity",
+        "total assets and liabilities",
+        "consolidated total assets", "net assets"
+      ]
+    },
+    "total_liabilities": {
+      "canonical": "total_liabilities",
+      "patterns": [
+        "total liabilities", "current liabilities",
+        "long-term liabilities", "total debt",
+        "total liabilities and shareholders' equity"
+      ]
+    },
+    "shareholders_equity": {
+      "canonical": "shareholders_equity",
+      "patterns": [
+        "shareholders' equity", "stockholders' equity",
+        "shareholders equity", "stockholders equity",
+        "total shareholders' equity", "total stockholders' equity",
+        "common stock", "additional paid-in capital",
+        "retained earnings", "accumulated other comprehensive income"
+      ]
+    },
+    "cash_and_equivalents": {
+      "canonical": "cash_and_equivalents",
+      "patterns": [
+        "cash and cash equivalents", "cash equivalents",
+        "cash and investments", "cash, cash equivalents and restricted cash",
+        "cash balance"
+      ]
+    },
+    "cash_flow": {
+      "canonical": "cash_flow",
+      "patterns": [
+        "cash flow", "cash flows",
+        "net cash provided by operating activities",
+        "net cash used in operating activities",
+        "operating cash flow", "free cash flow",
+        "net cash from operating activities",
+        "capital expenditures", "capex"
+      ]
+    },
+    "operating_expenses": {
+      "canonical": "operating_expenses",
+      "patterns": [
+        "operating expenses", "total operating expenses",
+        "operating costs", "operating costs and expenses",
+        "r&d expenses", "research and development",
+        "research and development expenses",
+        "sg&a", "selling general and administrative",
+        "selling, general and administrative",
+        "sales and marketing", "general and administrative",
+        "cost of revenue", "cost of sales", "cost of goods sold", "cogs"
+      ]
+    },
+    "debt": {
+      "canonical": "debt",
+      "patterns": [
+        "long-term debt", "short-term debt",
+        "current portion of long-term debt",
+        "total debt", "notes payable",
+        "senior notes", "borrowings",
+        "debt securities", "commercial paper"
+      ]
+    },
+    "working_capital": {
+      "canonical": "working_capital",
+      "patterns": [
+        "working capital", "net working capital",
+        "current assets", "current liabilities",
+        "accounts receivable", "accounts payable",
+        "inventory", "prepaid expenses"
+      ]
+    },
+    "dividends": {
+      "canonical": "dividends",
+      "patterns": [
+        "dividends", "dividend", "dividends per share",
+        "dividend yield", "dividend payments",
+        "share repurchase", "share buyback",
+        "stock repurchase", "capital return"
+      ]
+    },
+    "market_cap": {
+      "canonical": "market_cap",
+      "patterns": [
+        "market cap", "market capitalization",
+        "enterprise value", "market value",
+        "equity value", "firm value"
+      ]
+    },
+    "return_metrics": {
+      "canonical": "return_metrics",
+      "patterns": [
+        "roe", "return on equity",
+        "roa", "return on assets",
+        "roic", "return on invested capital",
+        "return on investment", "roi",
+        "profit margin", "net margin",
+        "operating margin", "gross margin percentage"
+      ]
+    },
+    "employee_compensation": {
+      "canonical": "employee_compensation",
+      "patterns": [
+        "compensation", "stock-based compensation",
+        "share-based compensation", "employee benefits",
+        "salaries", "wages", "payroll",
+        "pension", "retirement benefits",
+        "severance", "bonus"
+      ]
+    },
+    "tax": {
+      "canonical": "tax",
+      "patterns": [
+        "income tax", "tax expense", "tax provision",
+        "effective tax rate", "deferred tax",
+        "tax benefit", "tax liability",
+        "income tax expense", "income tax benefit"
+      ]
+    },
+    "segment_revenue": {
+      "canonical": "segment_revenue",
+      "patterns": [
+        "segment revenue", "segment operating income",
+        "geographic revenue", "product line revenue",
+        "business segment"
+      ]
+    }
+  },
+
+  "canonical_to_display": {
+    "revenue": "Revenue / Sales",
+    "net_income": "Net Income / Profit",
+    "operating_income": "Operating Income",
+    "gross_profit": "Gross Profit",
+    "eps": "Earnings Per Share (EPS)",
+    "ebitda": "EBITDA / EBIT",
+    "total_assets": "Total Assets",
+    "total_liabilities": "Total Liabilities / Debt",
+    "shareholders_equity": "Shareholders' Equity",
+    "cash_and_equivalents": "Cash & Equivalents",
+    "cash_flow": "Cash Flow / FCF",
+    "operating_expenses": "Operating Expenses / Costs",
+    "debt": "Long-Term / Short-Term Debt",
+    "working_capital": "Working Capital",
+    "dividends": "Dividends / Buybacks",
+    "market_cap": "Market Cap / Enterprise Value",
+    "return_metrics": "ROE / ROA / ROIC",
+    "employee_compensation": "Employee Compensation",
+    "tax": "Income Tax",
+    "segment_revenue": "Segment Revenue"
+  },
+
+  "_note": "To add new metrics: add a new group under metric_groups with canonical name and surface-form patterns. The script will automatically use them."
+}
