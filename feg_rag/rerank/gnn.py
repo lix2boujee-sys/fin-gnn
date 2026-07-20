@@ -24,6 +24,11 @@ from feg_rag.rerank.query_features import (
 )
 from feg_rag.rerank.scoring import normalise_score_map
 
+GRAPHSAGE_COMPAT_NOTE = (
+    "The historical GraphSAGEReranker name is kept for compatibility, but this "
+    "implementation is a dense GCN-style baseline, not a strict SAGEConv layer."
+)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # GNN Model
@@ -44,8 +49,7 @@ class GraphSAGEReranker(nn.Module):
         dropout: float = 0.3,
     ):
         super().__init__()
-        # We use a simple GCN here as a stand-in for GraphSAGE;
-        # swap to SAGEConv from torch_geometric in production.
+        # Historical "graphsage" key: this is dense GCN-style propagation.
         self.conv1 = nn.Linear(in_dim, hidden_dim)
         self.conv2 = nn.Linear(hidden_dim, out_dim)
         self.dropout = nn.Dropout(dropout)
@@ -336,7 +340,7 @@ class GNNFusionReranker:
         t_start = time.time()
         n_batches = len(loader)
         print(f"\n{'=' * 55}")
-        print(f"  Training GraphSAGE Reranker")
+        print(f"  Training GCN-style GNN Reranker")
         print(f"  Samples: {len(train_dataset)}  |  Epochs: {epochs}  |  "
               f"Batches/epoch: {n_batches}")
         print(f"  Batch size: {batch_size}  |  Device: {self.device}  |  LR: {lr}")

@@ -1,6 +1,6 @@
 # FEG-RAG
 
-Financial Evidence Graph RAG — 在 [FinDER](https://huggingface.co/datasets) 金融 QA 基准上，对比纯检索、图 + PPR 重排、GNN 重排（GraphSAGE / R-GCN）。
+Financial Evidence Graph RAG — 在 [FinDER](https://huggingface.co/datasets) 金融 QA 基准上，对比纯检索、图 + PPR 重排、GNN 重排（GCN-style GNN / R-GCN）。
 
 构建 **Financial Evidence Graph**（company / filing / section / chunk / metric / year），系统评估 BM25、Dense、Hybrid 及图方法对证据检索的影响。
 
@@ -84,19 +84,19 @@ PPR 在候选子图上运行，并与 Hybrid 检索分融合（`retrieval_weight
 
 ---
 
-### Exp4 — GNN Reranker（GraphSAGE，50 epoch）
+### Exp4 — GNN Reranker（GCN-style GNN，50 epoch）
 
 | 方法 | MRR | R@5 | **R@10** | nDCG@10 |
 |------|-----|-----|---------|---------|
 | Hybrid | 0.179 | 0.200 | 0.244 | 0.179 |
 | Hybrid + PPR | 0.178 | 0.200 | 0.244 | 0.178 |
-| **Hybrid + GraphSAGE** | 0.172 | 0.206 | **0.253** | 0.178 |
+| **Hybrid + GCN-style GNN** | 0.172 | 0.206 | **0.253** | 0.178 |
 
 - **训练**：4563 样本（80%），Loss 0.479 → 0.278（−42%），GNN 训练 ~19 min
 - **总耗时**：~133 min（Dense CPU 编码 + 5703 全量评估）
 - **Checkpoint**：`outputs/exp4_gnn_fulltest/model_checkpoints/exp4_gnn_reranker_20260710_183019.pt`
 
-**结论**：GraphSAGE 在全测试集上 **R@10=0.253**，比 Hybrid 高 **+0.9pp**；MRR 略低于 Hybrid。
+**结论**：GCN-style GNN 在全测试集上 **R@10=0.253**，比 Hybrid 高 **+0.9pp**；MRR 略低于 Hybrid。
 
 输出：`outputs/exp4_gnn_fulltest/metrics_summary.csv`
 
@@ -110,11 +110,11 @@ PPR 在候选子图上运行，并与 Hybrid 检索分融合（`retrieval_weight
 | Dense | 0.145 | 0.198 | Exp1 |
 | Hybrid | **0.184** | 0.244 | Exp1 |
 | Hybrid + Full PPR | 0.177 | 0.244 | Exp3 |
-| **Hybrid + GraphSAGE** | 0.172 | **0.253** | Exp4 |
+| **Hybrid + GCN-style GNN** | 0.172 | **0.253** | Exp4 |
 
 | 指标 | 最佳方法 |
 |------|----------|
-| **Recall@10** | Hybrid + GraphSAGE（0.253） |
+| **Recall@10** | Hybrid + GCN-style GNN（0.253） |
 | **MRR** | Hybrid（0.184） |
 
 更详细汇总见 [`outputs/experiments_summary.md`](outputs/experiments_summary.md)。
@@ -132,6 +132,17 @@ corpus. If no source documents are found, the code raises an error.
 
 `allow_gold_only_corpus: true` or `--allow_gold_only_corpus` is for explicit
 debug/smoke tests only and must not be used for paper results.
+
+Use `experiments/table1_non_llm_reranking_comparison.py` for current benchmark
+results. Older legacy scripts such as `experiments/exp1_retrieval_baseline.py`
+and `experiments/table1_retrieval_rerank.py` originally chunked FinDER annotated
+gold snippets directly into the candidate pool; those outputs should be treated
+as legacy/debug diagnostics, not as the paper's full-filing retrieval setting.
+
+The historical method key `graphsage` is also a compatibility name. Its current
+implementation is a dense GCN-style adjacency propagation baseline, not a strict
+Hamilton et al. GraphSAGE/SAGEConv model. Paper tables should label it as
+`GCN-style GNN` unless a true SAGEConv implementation is added.
 
 ### 1. 环境（推荐 D 盘，少占 C 盘）
 

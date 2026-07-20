@@ -1,7 +1,13 @@
-"""Table 1: Evidence Retrieval & Reranking Performance.
+"""Legacy Table 1: Evidence Retrieval & Reranking Performance.
 
 Evaluates all retrieval and reranking methods WITHOUT LLM generation.
 Methods: BM25, Dense, Hybrid, Hybrid+CrossEncoder, Hybrid+PPR.
+
+Legacy warning: this script builds a candidate pool from annotated FinDER gold
+evidence snippets plus distractors. It is useful for diagnostics, but paper
+benchmark results should use ``table1_non_llm_reranking_comparison.py``, which
+builds the corpus from source filings and aligns gold evidence back to those
+source-document chunks.
 
 Usage:
     python experiments/table1_retrieval_rerank.py --num_samples 500
@@ -44,7 +50,7 @@ def build_corpus(
     cfg: Config,
     max_distractor_files: int = 50,
 ) -> Tuple[List[Chunk], Dict[str, List[str]]]:
-    """Build chunk corpus from FinDER evidence + 10-K distractors."""
+    """Build legacy gold-snippet candidate pool plus 10-K distractors."""
     corpus_chunks: List[Chunk] = []
     gold_map: Dict[str, List[str]] = {}
 

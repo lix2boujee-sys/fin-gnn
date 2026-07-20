@@ -85,7 +85,7 @@ _METHOD_LABELS = {
     "best_retriever": "Best Retriever",
     "cross_encoder": "+ Cross-Encoder",
     "ppr": "+ PPR",
-    "graphsage": "+ GraphSAGE",
+    "graphsage": "+ GCN-style GNN",
     "rgcn": "+ R-GCN",
     "rgcn_constraint": "+ R-GCN + Constraint Score",
 }
@@ -707,7 +707,7 @@ def main() -> None:
     needs_gnn = bool(gnn_methods - skip_methods) and not args.skip_gnn
 
     if needs_gnn:
-        print("\n  Training GraphSAGE...")
+        print("\n  Training GCN-style GNN...")
         cfg.rerank["gnn_model"] = "sage"
         sage_reranker, sage_hist, sage_meta = train_gnn_reranker(
             train_samples, hybrid, graph, features, gold_map, cfg,

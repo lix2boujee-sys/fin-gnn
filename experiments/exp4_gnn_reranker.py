@@ -698,7 +698,7 @@ def write_exp4_readme(
             "hybrid": "Hybrid Retrieval",
             "hybrid+cross_encoder": "Hybrid + Cross-Encoder",
             "hybrid+ppr": "Hybrid + PPR",
-            "hybrid+sage": "Hybrid + GraphSAGE",
+            "hybrid+sage": "Hybrid + GCN-style GNN",
             "hybrid+rgcn": "Hybrid + R-GCN",
             "feg_rerank": "FEG-Rerank",
         }.get(method, method)
@@ -1112,7 +1112,7 @@ def main() -> None:
         label = {
             "hybrid": "Hybrid",
             "hybrid+ppr": "Hybrid + PPR",
-            "hybrid+sage": "Hybrid + GraphSAGE",
+            "hybrid+sage": "Hybrid + GCN-style GNN",
             "hybrid+rgcn": "Hybrid + R-GCN",
             "feg_rerank": "FEG-Rerank",
         }.get(method, method)

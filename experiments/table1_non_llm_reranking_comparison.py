@@ -8,7 +8,7 @@ Methods compared:
     Best Retriever (Hybrid E5-Mistral)
     + Cross-Encoder
     + PPR
-    + GraphSAGE
+    + GCN-style GNN
     + R-GCN
     + R-GCN Lite
     + R-GCN + Constraint Score
@@ -460,7 +460,7 @@ METHOD_LABELS = {
     "best_retriever": "Best Retriever",
     "cross_encoder": "+ Cross-Encoder",
     "ppr": "+ PPR",
-    "graphsage": "+ GraphSAGE",
+    "graphsage": "+ GCN-style GNN",
     "gatv2": "+ GATv2",
     "rgcn": "+ R-GCN",
     "rgcn_lite": "R-GCN Lite",
@@ -2015,7 +2015,7 @@ def main() -> None:
                         help="Train/val split ratio")
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--skip_gnn", action="store_true",
-                        help="Skip GNN training (GraphSAGE, R-GCN, DCF-GNN, R-GCN+Constraint)")
+                        help="Skip GNN training (GCN-style GNN, R-GCN, DCF-GNN, R-GCN+Constraint)")
     parser.add_argument("--corpus_cache", default=None,
                         help="Pickle cache for full benchmark corpus/gold_map")
     parser.add_argument("--rebuild_corpus_cache", action="store_true",
@@ -2035,7 +2035,7 @@ def main() -> None:
     parser.add_argument("--methods", default="best_retriever,cross_encoder,ppr,graphsage,rgcn,rgcn_constraint",
                         help="Comma-separated methods to run (available: best_retriever, cross_encoder, ppr, graphsage, gatv2, rgcn, rgcn_lite, dcf_gnn, c2_dcf_gnn, rgcn_constraint, qfe_rgcn, qfe_rgcn_v2, qfe_rgcn_ppr, mono_t5, list_t5, fast_final_graph)")
     parser.add_argument("--load_graphsage_checkpoint", default=None,
-                        help="Load a saved GraphSAGE checkpoint and evaluate without retraining")
+                        help="Load a saved GCN-style GNN checkpoint and evaluate without retraining")
     parser.add_argument("--load_gatv2_checkpoint", default=None,
                         help="Load a saved GATv2 checkpoint and evaluate without retraining")
     parser.add_argument("--load_rgcn_checkpoint", default=None,
@@ -2091,7 +2091,7 @@ def main() -> None:
     parser.add_argument("--qfe_use_ppr", action="store_true",
                         help="QFE-RGCN: also compute PPR scores as auxiliary graph features (ablation only)")
     parser.add_argument("--gnn_use_ppr", action="store_true",
-                        help="GraphSAGE/R-GCN: compute PPR auxiliary scores during evaluation (slow; default off)")
+                        help="GCN-style GNN/R-GCN: compute PPR auxiliary scores during evaluation (slow; default off)")
     parser.add_argument("--rerank_checkpoint_every", type=int, default=100,
                         help="Write reranker partial JSONL and print progress every N queries")
     parser.add_argument("--gnn_eval_cache", default=None,
@@ -2407,11 +2407,11 @@ def main() -> None:
 
     # 5d/e/f. GNN methods (train on train_samples, eval on eval_samples)
     if not args.skip_gnn:
-        # Train GraphSAGE
+        # Train dense GCN-style GNN (historical method key: graphsage)
         if "graphsage" in selected_methods:
             t0 = time.time()
             if args.load_graphsage_checkpoint:
-                print("\n  [graphsage] Loading GraphSAGE checkpoint...")
+                print("\n  [graphsage] Loading GCN-style GNN checkpoint...")
                 sage_reranker = _load_graphsage_checkpoint(
                     args.load_graphsage_checkpoint,
                     base_feature_dim=feature_dim,
@@ -2425,7 +2425,7 @@ def main() -> None:
                         "--eval_only_checkpoint requested but "
                         "--load_graphsage_checkpoint was not provided"
                     )
-                print("\n  [graphsage] Training GraphSAGE reranker...")
+                print("\n  [graphsage] Training GCN-style GNN reranker...")
                 cfg.rerank["gnn_model"] = "sage"
                 sage_reranker, sage_history, sage_meta = train_gnn_reranker(
                     train_samples, candidate_retriever, graph, features, gold_map, cfg,
@@ -2440,7 +2440,7 @@ def main() -> None:
                         experiment="table1_graphsage",
                     )
                     print(f"    Training done in {time.time() - t0:.1f}s")
-                print(f"    Evaluating GraphSAGE on {len(eval_samples)} samples...")
+                print(f"    Evaluating GCN-style GNN on {len(eval_samples)} samples...")
                 t_eval = time.time()
                 all_results["graphsage"] = run_gnn_reranker(
                     eval_samples, candidate_retriever, graph, features, gold_map,
@@ -2454,7 +2454,7 @@ def main() -> None:
                 print(f"    Evaluation done in {time.time() - t_eval:.1f}s")
                 _checkpoint_method(output_dir, "graphsage", all_results, k_values)
             else:
-                print("    [SKIP] GraphSAGE training failed (not enough pairs)")
+                print("    [SKIP] GCN-style GNN training failed (not enough pairs)")
 
         # Train GATv2
         if "gatv2" in selected_methods:
@@ -3047,7 +3047,7 @@ def main() -> None:
             else:
                 print("    [SKIP] QFE-RGCN v2 training failed (not enough pairs)")
     else:
-        print("\n  [skip_gnn] Skipping GraphSAGE, R-GCN, and R-GCN+Constraint.")
+        print("\n  [skip_gnn] Skipping GCN-style GNN, R-GCN, and R-GCN+Constraint.")
 
     # ---- Fast Final Graph (lightweight fusion, no GNN needed) ----
     if "fast_final_graph" in selected_methods:
@@ -3277,7 +3277,7 @@ def main() -> None:
         "best_retriever": "Best Retriever      ",
         "cross_encoder": "+ Cross-Encoder      ",
         "ppr": "+ PPR                ",
-        "graphsage": "+ GraphSAGE          ",
+        "graphsage": "+ GCN-style GNN      ",
         "rgcn": "+ R-GCN              ",
         "rgcn_lite": "R-GCN Lite           ",
         "dcf_gnn": "DCF-GNN (Ours)       ",

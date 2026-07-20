@@ -46,7 +46,12 @@ def build_corpus(
     cfg: Config,
     max_distractor_files: int = 50,
 ) -> Tuple[List[Chunk], Dict[str, List[str]]]:
-    """Chunk FinDER gold evidence; optionally add 10-K distractors."""
+    """Build legacy gold-snippet candidate pool plus optional 10-K distractors.
+
+    This legacy experiment inserts annotated FinDER evidence snippets directly
+    into the candidate pool. Use ``table1_non_llm_reranking_comparison.py`` for
+    paper benchmark results on source-filing chunks.
+    """
     corpus_chunks: List[Chunk] = []
     gold_map: Dict[str, List[str]] = {}
 
